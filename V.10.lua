@@ -9,7 +9,7 @@ local SaveManager = loadstring(game:HttpGet(repo .. 'addons/SaveManager.lua'))()
 
 
 local Window = Library:CreateWindow({
-    Title = 'EXAMPLE MENU',
+    Title = 'BY UNKER AND LELOUCH, WITH THANKS TO BIG 30, OTF JAM AND JORDAN',
     Center = true,
     AutoShow = true,
     TabPadding = 8,
@@ -43,6 +43,25 @@ local TeamsFolder = workspace:WaitForChild("Teams")
 
 local RunService = game:GetService("RunService")
 local player = LocalPlayer
+
+-- Shared cache: maps instance → team folder under TeamsFolder.
+-- Weak keys so entries get garbage-collected when the instance is destroyed.
+TeamFolderCache = setmetatable({}, {__mode = "k"})
+
+local function resolveTeamFolder(instance)
+    local cached = TeamFolderCache[instance]
+    if cached and cached.Parent then
+        return cached
+    end
+    local obj = instance
+    while obj and obj.Parent ~= TeamsFolder do
+        obj = obj.Parent
+    end
+    if obj then
+        TeamFolderCache[instance] = obj
+    end
+    return obj
+end
 
 -- ESP TAB GROUPBOXES
 
@@ -662,6 +681,21 @@ local function MakeHealthBar(parent, current, max)
     return bar, fill
 end
 
+
+local function HookBuildingMovement(display)
+    local torso = display.torso
+    if not torso then return end
+
+    if display.movementConnection then
+        display.movementConnection:Disconnect()
+        display.movementConnection = nil
+    end
+
+    display.movementConnection = torso:GetPropertyChangedSignal("CFrame"):Connect(function()
+        UpdateAllDisplays()
+    end)
+end
+
 local function CreateDisplay(building, teamFolder)
     local torso = building:FindFirstChild("Torso")
     if not torso then return end
@@ -778,6 +812,9 @@ local function CreateDisplay(building, teamFolder)
         requiredHeight = 100
     }
 
+    -- Hook torso movement so the UI follows the building when it moves
+    HookBuildingMovement(ActiveDisplays[building])
+
     -- defer actual UI build to the throttled loop
     MarkBuildingDirty(building)
 
@@ -786,9 +823,25 @@ local function CreateDisplay(building, teamFolder)
         if not parent then
             local display = ActiveDisplays[building]
             if display then
-                -- Disconnect production connections
-                for _, conn in ipairs(display.productionConnections) do
+                -- Disconnect production UI connections
+                for _, conn in ipairs(display.productionConnections or {}) do
                     conn:Disconnect()
+                end
+                -- Disconnect hook connections (garrison + production folder hooks)
+                for _, conn in ipairs(display.hookConnections or {}) do
+                    conn:Disconnect()
+                end
+                -- Disconnect health connections
+                if HealthConnections[building] then
+                    for _, conn in ipairs(HealthConnections[building]) do
+                        conn:Disconnect()
+                    end
+                    HealthConnections[building] = nil
+                end
+                -- Disconnect movement connection
+                if display.movementConnection then
+                    display.movementConnection:Disconnect()
+                    display.movementConnection = nil
                 end
                 if display.part then
                     display.part:Destroy()
@@ -798,7 +851,6 @@ local function CreateDisplay(building, teamFolder)
         end
     end)
 end
-
 
 ---------------------------------------------------------------
 -- UPDATE GARRISON DISPLAY (without scaling)
@@ -1226,29 +1278,59 @@ local function UpdateAllDisplays()
     local healed = false
 
 	for building, display in pairs(ActiveDisplays or {}) do
-		-- 1) Building itself is gone
+		-- 1) Building itself is gone (AncestryChanged cleanup will handle this too)
         if not building or not building.Parent then
             deadBuildings[building] = true
         else
+            -- === TORSO HEAL ===
             local torso = display.torso
-            -- 2) Torso reference is stale (skin change)
-            if not torso or not torso.Parent or not torso:IsDescendantOf(building) then
+            local torsoValid = torso and torso.Parent and torso:IsDescendantOf(building)
+            if not torsoValid then
                 local newTorso = building:FindFirstChild("Torso")
                 if newTorso and newTorso:IsA("BasePart") then
-                    -- Heal the display
                     display.torso = newTorso
-                    local newGarrisoned = newTorso:FindFirstChild("Garrisoned")
-                    if newGarrisoned then
-                        display.folder = newGarrisoned
-                        -- Re‑hook events to the new folder
-                        Hook(building, newGarrisoned, display.teamFolder)
-                        MarkBuildingDirty(building)
-                        healed = true
-                    else
-                        deadBuildings[building] = true
+                    torso = newTorso
+                    HookBuildingMovement(display)
+                end
+            end
+
+            -- === GARRISON FOLDER HEAL ===
+            -- Valid = exists AND is a descendant of the current torso
+            local folderValid = display.folder
+                and display.folder.Parent
+                and torso
+                and display.folder:IsDescendantOf(torso)
+            if not folderValid and torso then
+                local newGarrisoned = torso:FindFirstChild("Garrisoned")
+                if newGarrisoned then
+                    -- Disconnect old hooks tied to the previous folder
+                    for _, conn in ipairs(display.hookConnections or {}) do
+                        conn:Disconnect()
                     end
+                    display.hookConnections = {}
+
+                    display.folder = newGarrisoned
+                    Hook(building, newGarrisoned, display.teamFolder)
+                    MarkBuildingDirty(building)
+                    healed = true
+                end
+                -- Do NOT mark as dead if newGarrisoned is nil.
+                -- The building may just be mid-rebuild. We'll retry next frame.
+            end
+
+            -- === PRODUCTION FOLDER HEAL ===
+            local prodValid = display.productionFolder
+                and display.productionFolder.Parent
+                and torso
+                and display.productionFolder:IsDescendantOf(torso)
+            if not prodValid and torso then
+                local newProduction = torso:FindFirstChild("Producing")
+                if newProduction and newProduction ~= display.productionFolder then
+                    display.productionFolder = newProduction
+                    HookProduction(building, newProduction, display.teamFolder)
+                    MarkBuildingDirty(building)
                 else
-                    deadBuildings[building] = true
+                    display.productionFolder = newProduction
                 end
             end
 
@@ -1287,18 +1369,6 @@ workspace.CurrentCamera:GetPropertyChangedSignal("CFrame"):Connect(function()
     UpdateAllDisplays()
 end)
 
----------------------------------------------------------------
--- BUILDING MOVEMENT EVENT
----------------------------------------------------------------
-
-local function HookBuildingMovement(display)
-    local torso = display.torso
-    if not torso then return end
-
-    torso:GetPropertyChangedSignal("CFrame"):Connect(function()
-        UpdateAllDisplays()
-    end)
-end
 
 ---------------------------------------------------------------
 -- SETTINGS CHANGE EVENTS
@@ -1321,19 +1391,13 @@ end
 
 HookSettingRefresh()
 
----------------------------------------------------------------
--- INITIALIZE MOVEMENT HOOKS FOR EXISTING DISPLAYS
----------------------------------------------------------------
-
-task.defer(function()
-    for _, display in pairs(ActiveDisplays or {}) do
-        HookBuildingMovement(display)
-    end
-end)
 
 ---------------------------------------------------------------
 -- THROTTLED UI UPDATE LOOP (ONCE PER HEARTBEAT, DIRTY ONLY)
 ---------------------------------------------------------------
+
+local lastDisplayReposition = 0
+local DISPLAY_REPOSITION_INTERVAL = 1 / 144
 
 RunService.Heartbeat:Connect(function()
     -- Process dirty buildings (rebuild UI)
@@ -1353,8 +1417,12 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- Always update positions + scaling
-    UpdateAllDisplays()
+    -- Ensure new/moved displays are positioned even if the camera is still.
+    local now = tick()
+    if now - lastDisplayReposition >= DISPLAY_REPOSITION_INTERVAL then
+        lastDisplayReposition = now
+        UpdateAllDisplays()
+    end
 end)
 
 ---------------------------------------------------------------
@@ -1362,20 +1430,23 @@ end)
 ---------------------------------------------------------------
 
 local function Hook(building, folder, teamFolder)
+    local display = ActiveDisplays[building]
+    if not display then return end
+    display.hookConnections = display.hookConnections or {}
+
     local function Refresh()
         MarkBuildingDirty(building)
     end
 
-    -- initial
     Refresh()
 
-    folder.ChildAdded:Connect(function()
+    table.insert(display.hookConnections, folder.ChildAdded:Connect(function()
         task.defer(Refresh)
-    end)
+    end))
 
-    folder.ChildRemoved:Connect(function()
+    table.insert(display.hookConnections, folder.ChildRemoved:Connect(function()
         task.defer(Refresh)
-    end)
+    end))
 end
 
 
@@ -1386,8 +1457,8 @@ end
 local function HookProduction(building, productionFolder, teamFolder)
     local display = ActiveDisplays[building]
     if not display then return end
+    display.hookConnections = display.hookConnections or {}
 
-    -- Initial queue order from current folder children (alphabetical)
     display.queueOrder = {}
     for _, child in ipairs(productionFolder:GetChildren()) do
         table.insert(display.queueOrder, child)
@@ -1398,12 +1469,12 @@ local function HookProduction(building, productionFolder, teamFolder)
         MarkBuildingDirty(building)
     end
 
-    productionFolder.ChildAdded:Connect(function(child)
+    table.insert(display.hookConnections, productionFolder.ChildAdded:Connect(function(child)
         table.insert(display.queueOrder, child)
         task.defer(refresh)
-    end)
+    end))
 
-    productionFolder.ChildRemoved:Connect(function(child)
+    table.insert(display.hookConnections, productionFolder.ChildRemoved:Connect(function(child)
         for i, item in ipairs(display.queueOrder) do
             if item == child then
                 table.remove(display.queueOrder, i)
@@ -1411,7 +1482,7 @@ local function HookProduction(building, productionFolder, teamFolder)
             end
         end
         task.defer(refresh)
-    end)
+    end))
 
     refresh()
 end
@@ -1909,9 +1980,7 @@ NukeMiscGroup:AddSlider('AlertVolume', {
 
 -- ---------- LOCAL HELPERS (getTeamFolder, etc.) ----------
 local function getTeamFolder(instance)
-    local obj = instance
-    while obj and obj.Parent ~= TeamsFolder do obj = obj.Parent end
-    return obj
+    return resolveTeamFolder(instance)
 end
 
 local function getPlayerName(teamColor)
@@ -1944,7 +2013,7 @@ end
 
 -- ---------- NUKE LAUNCH NOTIFICATION + AUDIO ----------
 local notifiedLaunches = {}
-local debugNuke = true   -- set false to hide speed prints
+local debugNuke = false   -- set false to hide speed prints
 
 RunService.Heartbeat:Connect(function()
     if not Toggles.NotifyNukeLaunch.Value then return end
@@ -2075,9 +2144,7 @@ local function isMoving(missile)
 end
 
 local function getTeamFolder(instance)
-    local obj = instance
-    while obj and obj.Parent ~= TeamsFolder do obj = obj.Parent end
-    return obj
+    return resolveTeamFolder(instance)
 end
 
 local function isLocalOwner(missile)
@@ -2094,27 +2161,37 @@ local nukeHighlights = {}   -- [model] = { highlight, highlight, ... }
 local siloHighlights = {}   -- [model] = { highlight, ... }
 
 local function applyHighlight(model, outlineColor, innerColor, outlineTransparency, highlightsTable)
-    local parts = {}
-    for _, child in ipairs(model:GetChildren()) do
-        if child:IsA("BasePart") then
-            table.insert(parts, child)
-        end
-    end
-    
     local highlights = highlightsTable[model]
     if not highlights then
         highlights = {}
         highlightsTable[model] = highlights
-        for _, part in ipairs(parts) do
+    end
+
+    -- Clean up stale highlights (part destroyed or highlight removed)
+    local alreadyAdorned = {}
+    for i = #highlights, 1, -1 do
+        local hl = highlights[i]
+        if not hl or not hl.Parent or not hl.Adornee or not hl.Adornee.Parent then
+            if hl then hl:Destroy() end
+            table.remove(highlights, i)
+        else
+            alreadyAdorned[hl.Adornee] = true
+        end
+    end
+
+    -- Add highlights for any new parts that appeared since last check
+    for _, child in ipairs(model:GetChildren()) do
+        if child:IsA("BasePart") and not alreadyAdorned[child] then
             local hl = Instance.new("Highlight")
-            hl.Adornee = part
+            hl.Adornee = child
             hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
             hl.FillTransparency = 0.5
-            hl.Parent = part
+            hl.Parent = child
             table.insert(highlights, hl)
         end
     end
-    
+
+    -- Apply colors to all current highlights
     for _, hl in ipairs(highlights) do
         hl.FillColor = innerColor
         hl.OutlineColor = outlineColor
@@ -2126,7 +2203,7 @@ local function removeHighlight(model, highlightsTable)
     local highlights = highlightsTable[model]
     if highlights then
         for _, hl in ipairs(highlights) do
-            hl:Destroy()
+            if hl then hl:Destroy() end
         end
         highlightsTable[model] = nil
     end
@@ -3437,7 +3514,7 @@ local WatermarkConnection = game:GetService('RunService').RenderStepped:Connect(
         FrameCounter = 0;
     end;
 
-    Library:SetWatermark(('LinoriaLib demo | %s fps | %s ms'):format(
+    Library:SetWatermark(('LELOUCHWARE V0.10 | %s fps | %s ms'):format(
         math.floor(FPS),
         math.floor(game:GetService('Stats').Network.ServerStatsItem['Data Ping']:GetValue())
     ));
