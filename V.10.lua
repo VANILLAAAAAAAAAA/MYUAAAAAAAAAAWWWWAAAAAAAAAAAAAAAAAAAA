@@ -2210,10 +2210,10 @@ local function removeHighlight(model, highlightsTable)
 end
 
 -- Returns "idle", "producing", or "ready" for a given silo model.
---   idle      → nothing in Producing, no ready missile for this silo
+--   idle      → nothing in Producing, no ready missile near this silo
 --   producing → a missile is inside Producing with Progress < 1
---   ready     → a missile has finished (Progress >= 1 in Producing,
---               or is sitting in the team folder with low velocity and points back at this silo)
+--   ready     → a missile has finished producing (Progress >= 1 in Producing),
+--               OR a stationary missile is sitting near this silo's torso in the team folder
 local function siloNukeState(model)
     local torso = model:FindFirstChild("Torso")
     if not torso then return "idle" end
@@ -2238,17 +2238,24 @@ local function siloNukeState(model)
         end
     end
 
-    -- 2) Ready missiles that have been moved out of Producing into the team folder
+    -- 2) Ready missiles sitting in the team folder near this silo.
+    -- Many games don't expose a Silo ObjectValue, so we fall back to proximity:
+    -- any stationary missile whose root is within READY_DISTANCE studs of this silo's
+    -- torso belongs to this silo.
+    local READY_DISTANCE = 40  -- adjust if your silos are larger/smaller
     local teamFolder = model.Parent
     if teamFolder then
+        local siloPos = torso.Position
         for _, obj in ipairs(teamFolder:GetChildren()) do
             if obj:IsA("Model") and (obj.Name == "Nuclear Missile" or obj.Name == "Fire Missile") then
-                local siloVal = obj:FindFirstChild("Silo")
-                if siloVal and siloVal:IsA("ObjectValue") and siloVal.Value == model then
-                    local root = obj:FindFirstChild("Torso") or obj:FindFirstChildWhichIsA("BasePart")
-                    local vel = root and root.AssemblyLinearVelocity.Magnitude or 0
+                local root = obj:FindFirstChild("Torso") or obj:FindFirstChildWhichIsA("BasePart")
+                if root then
+                    local vel = root.AssemblyLinearVelocity.Magnitude
                     if vel <= 1 then
-                        return "ready"
+                        local dist = (root.Position - siloPos).Magnitude
+                        if dist <= READY_DISTANCE then
+                            return "ready"
+                        end
                     end
                 end
             end
