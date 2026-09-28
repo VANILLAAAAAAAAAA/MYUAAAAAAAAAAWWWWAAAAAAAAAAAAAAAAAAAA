@@ -1883,7 +1883,7 @@ NukeMiscGroup:AddToggle('NotifyNukeTeamCheck', { Text = 'Team Check', Default = 
 
 NukeMiscGroup:AddLabel('Launch Alert Sound')
 NukeMiscGroup:AddDropdown('AlertSound', {
-    Values = { 'None', 'UTHINKIMDUMB', 'LLTNT', 'NEW YEAR NEW ME', 'BHAJLSC', 'DOAFTCS', 'HOW U MAKE OAT MEAL', 'FACTORIO', 'FACTORIO OLD',  'NEOH' },
+    Values = { 'None', 'UTHINKIMDUMB', 'LLTNT', 'NEW YEAR NEW ME', 'BHAJLSC', 'DOAFTCS', 'HOW U MAKE OAT MEAL', 'FACTORIO', 'FACTORIO OLD', 'LELOUCH',  'NEOH' },
     Default = 'UTHINKIMDUMB',
     Multi = false,
     Text = 'Alert Sound'
@@ -1898,7 +1898,8 @@ local soundUrls = {
 	['DOAFTCS']  = 'https://u.pone.rs/gfywjrhv.mp3',
 	['HOW U MAKE OAT MEAL']  = 'https://u.pone.rs/lfbuhrmc.mp3',
     ['FACTORIO']    = 'https://u.pone.rs/xyypgrho.mp3',
-    ['FACTORIO OLD']  = 'https://u.pone.rs/qjxduqcj.mp3',
+    ['FACTORIO OLD']  = 'https://u.pone.rs/qjxduqcj.mp3', 
+	['LELOUCH']  = 'https://u.pone.rs/wstbohkr.mp3',
     ['NEOH']    = 'https://u.pone.rs/cwhtmzkg.ogg',
 }
 local soundCache = {}
