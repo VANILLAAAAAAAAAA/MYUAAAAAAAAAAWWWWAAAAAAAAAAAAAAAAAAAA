@@ -2085,7 +2085,7 @@ SiloESPGroup:AddToggle('SiloESPIgnoreLocal', { Text = 'Ignore Local', Default = 
 
 SiloESPGroup:AddLabel('Silo Colors')
 SiloESPGroup:AddDivider()
-SiloESPGroup:AddDropdown('SiloColorMode', { Values = { 'Team Color', 'Custom', 'RGB' }, Default = 'Team Color', Multi = false, Text = 'Silo Color Mode' })
+SiloESPGroup:AddDropdown('SiloColorMode', { Values = { 'Team Color', 'Custom', 'RGB', 'Green, Yellow, Red - No Nuke, Producing, Nuke' }, Default = 'Team Color', Multi = false, Text = 'Silo Color Mode' })
 SiloESPGroup:AddLabel('Silo Outline'):AddColorPicker('SiloOutlineColor', { Default = Color3.fromRGB(255, 100, 100), Title = 'Silo Outline' })
 SiloESPGroup:AddLabel('Silo Inner'):AddColorPicker('SiloInnerColor', { Default = Color3.fromRGB(255, 0, 0), Title = 'Silo Inner' })
 SiloESPGroup:AddSlider('SiloOutlineThickness', { Text = 'Silo Outline Thickness', Default = 1, Min = 0, Max = 1, Rounding = 2, Compact = false })
@@ -2207,6 +2207,55 @@ local function removeHighlight(model, highlightsTable)
         end
         highlightsTable[model] = nil
     end
+end
+
+-- Returns "idle", "producing", or "ready" for a given silo model.
+--   idle      → nothing in Producing, no ready missile for this silo
+--   producing → a missile is inside Producing with Progress < 1
+--   ready     → a missile has finished (Progress >= 1 in Producing,
+--               or is sitting in the team folder with low velocity and points back at this silo)
+local function siloNukeState(model)
+    local torso = model:FindFirstChild("Torso")
+    if not torso then return "idle" end
+
+    -- 1) Missile currently in the silo's Producing folder
+    local producing = torso:FindFirstChild("Producing")
+    if producing then
+        for _, child in ipairs(producing:GetChildren()) do
+            if child.Name == "Nuclear Missile" or child.Name == "Fire Missile" then
+                local prog = child:FindFirstChild("Progress")
+                if prog and prog:IsA("NumberValue") then
+                    if prog.Value >= 1 then
+                        return "ready"
+                    else
+                        return "producing"
+                    end
+                else
+                    -- No Progress value on the missile → assume it's finished
+                    return "ready"
+                end
+            end
+        end
+    end
+
+    -- 2) Ready missiles that have been moved out of Producing into the team folder
+    local teamFolder = model.Parent
+    if teamFolder then
+        for _, obj in ipairs(teamFolder:GetChildren()) do
+            if obj:IsA("Model") and (obj.Name == "Nuclear Missile" or obj.Name == "Fire Missile") then
+                local siloVal = obj:FindFirstChild("Silo")
+                if siloVal and siloVal:IsA("ObjectValue") and siloVal.Value == model then
+                    local root = obj:FindFirstChild("Torso") or obj:FindFirstChildWhichIsA("BasePart")
+                    local vel = root and root.AssemblyLinearVelocity.Magnitude or 0
+                    if vel <= 1 then
+                        return "ready"
+                    end
+                end
+            end
+        end
+    end
+
+    return "idle"
 end
 
 -- ============================================================
@@ -2338,10 +2387,6 @@ RunService.Heartbeat:Connect(function()
                     end
                 end
 
-                if shouldShow and Toggles.SiloESPIgnoreLocal.Value and isLocalOwner(model) then
-                    shouldShow = false
-                end
-
                 if not shouldShow then
                     removeHighlight(model, siloHighlights)
                 else
@@ -2356,7 +2401,19 @@ RunService.Heartbeat:Connect(function()
                         inner = getGlobalRGBColor()
                         outline = inner:Lerp(Color3.new(0,0,0), 0.3)
                         outlineTrans = 1 - Options.SiloOutlineThickness.Value
+                    elseif mode == 'Green, Yellow, Red - No Nuke, Producing, Nuke' then
+                        local state = siloNukeState(model)
+                        if state == "ready" then
+                            inner = Color3.fromRGB(255, 0, 0)     -- red
+                        elseif state == "producing" then
+                            inner = Color3.fromRGB(255, 255, 0)   -- yellow
+                        else
+                            inner = Color3.fromRGB(0, 255, 0)     -- green
+                        end
+                        outline = inner:Lerp(Color3.new(0,0,0), 0.3)
+                        outlineTrans = 1 - Options.SiloOutlineThickness.Value
                     else
+                        -- Custom
                         outline = Options.SiloOutlineColor.Value
                         inner = Options.SiloInnerColor.Value
                         outlineTrans = 1 - Options.SiloOutlineThickness.Value
@@ -2403,6 +2460,17 @@ TeamsFolder.DescendantAdded:Connect(function(descendant)
             outlineTrans = 1 - Options.SiloOutlineThickness.Value
         elseif mode == 'RGB' then
             inner = rgbColor()
+            outline = inner:Lerp(Color3.new(0,0,0), 0.3)
+            outlineTrans = 1 - Options.SiloOutlineThickness.Value
+        elseif mode == 'Green, Yellow, Red - No Nuke, Producing, Nuke' then
+            local state = siloNukeState(model)
+            if state == "ready" then
+                inner = Color3.fromRGB(255, 0, 0)
+            elseif state == "producing" then
+                inner = Color3.fromRGB(255, 255, 0)
+            else
+                inner = Color3.fromRGB(0, 255, 0)
+            end
             outline = inner:Lerp(Color3.new(0,0,0), 0.3)
             outlineTrans = 1 - Options.SiloOutlineThickness.Value
         else
