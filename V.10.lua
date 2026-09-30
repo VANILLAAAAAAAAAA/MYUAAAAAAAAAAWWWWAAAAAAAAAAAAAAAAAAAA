@@ -1,698 +1,1212 @@
--- New example script written by wally
--- You can suggest changes with a pull request or something
+-- ============================================================
+-- LELOUCHWARE V0.11 - RESTRUCTURED
+-- One heartbeat. One dispatcher. One highlight manager.
+-- ============================================================
 
 local repo = 'https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/'
-
-local Library = loadstring(game:HttpGet(repo .. 'Library.lua'))()
+local Library      = loadstring(game:HttpGet(repo .. 'Library.lua'))()
 local ThemeManager = loadstring(game:HttpGet(repo .. 'addons/ThemeManager.lua'))()
-local SaveManager = loadstring(game:HttpGet(repo .. 'addons/SaveManager.lua'))()
+local SaveManager  = loadstring(game:HttpGet(repo .. 'addons/SaveManager.lua'))()
 
+local Players      = game:GetService("Players")
+local StarterGui   = game:GetService("StarterGui")
+local RunService   = game:GetService("RunService")
+local HttpService  = game:GetService("HttpService")
+local TeamsService = game:GetService("Teams")
 
+local LocalPlayer  = Players.LocalPlayer
+local TeamSettings = workspace:WaitForChild("TeamSettings")
+local TeamsFolder  = workspace:WaitForChild("Teams")
+
+-- ============================================================
+-- WINDOW & TABS
+-- ============================================================
 local Window = Library:CreateWindow({
     Title = 'BY UNKER AND LELOUCH, WITH THANKS TO BIG 30, OTF JAM AND JORDAN',
-    Center = true,
-    AutoShow = true,
-    TabPadding = 8,
-    MenuFadeTime = 0.2
+    Center = true, AutoShow = true, TabPadding = 8, MenuFadeTime = 0.2
 })
-
 Window.ShowInToggleKeybind = false
 
--- CALLBACK NOTE:
--- Passing in callback functions via the initial element parameters (i.e. Callback = function(Value)...) works
--- HOWEVER, using Toggles/Options.INDEX:OnChanged(function(Value) ... ) is the RECOMMENDED way to do this.
--- I strongly recommend decoupling UI code from logic code. i.e. Create your UI elements FIRST, and THEN setup :OnChanged functions later.
-
--- You do not have to set your tabs & groups up this way, just a prefrence.
 local Tabs = {
-    -- Creates a new tab titled Main
-    Main = Window:AddTab('Main'),
-    ESP = Window:AddTab('ESP'),
-    Nuclear = Window:AddTab('Nuclear'),
-	PlayerInfo = Window:AddTab('Player Info'),
-    ['UI Settings'] = Window:AddTab('UI Settings'),
+    Nuke          = Window:AddTab('Nuke'),
+    NukeInfo      = Window:AddTab('Nuke Info'),
+    ESP           = Window:AddTab('ESP'),
+    Notifications = Window:AddTab('Notify'),
+    Garrison      = Window:AddTab('Misc'),
+    RGB           = Window:AddTab('RGB'),
+    PlayerInfo    = Window:AddTab('Player Info'),
+    ['UI Settings'] = Window:AddTab('UI'),
 }
 
---TeamSettings
-local Players = game:GetService("Players")
-local StarterGui = game:GetService("StarterGui")
-local LocalPlayer = Players.LocalPlayer
+-- ============================================================
+-- TEAM DATA - cached team facts (never re-walks folders per frame)
+-- ============================================================
+local TeamData = {
+    _myTeamColor     = nil,
+    _myAlliedColors  = nil,
+    _alliances       = nil,
+    _teamColorByName = {},
+    _playerHistory   = {},   -- [teamName] = {names...}
+}
 
-local TeamSettings = workspace:WaitForChild("TeamSettings")
-local TeamsFolder = workspace:WaitForChild("Teams")
+function TeamData.invalidateMyTeam()  TeamData._myTeamColor = nil; TeamData._myAlliedColors = nil end
+function TeamData.invalidateAlliances() TeamData._alliances = nil end
+function TeamData.invalidateTeamColor(name) TeamData._teamColorByName[name] = nil end
+function TeamData.invalidatePlayerHistory(name) TeamData._playerHistory[name] = nil end
 
-local RunService = game:GetService("RunService")
-local player = LocalPlayer
-
--- Shared cache: maps instance → team folder under TeamsFolder.
--- Weak keys so entries get garbage-collected when the instance is destroyed.
-TeamFolderCache = setmetatable({}, {__mode = "k"})
-
-local function resolveTeamFolder(instance)
-    local cached = TeamFolderCache[instance]
-    if cached and cached.Parent then
-        return cached
+function TeamData.getMyTeamColor()
+    if not TeamData._myTeamColor then
+        TeamData._myTeamColor = LocalPlayer.TeamColor and LocalPlayer.TeamColor.Name or nil
     end
-    local obj = instance
-    while obj and obj.Parent ~= TeamsFolder do
-        obj = obj.Parent
-    end
-    if obj then
-        TeamFolderCache[instance] = obj
-    end
-    return obj
+    return TeamData._myTeamColor
 end
 
--- ESP TAB GROUPBOXES
+function TeamData.getMyAlliedColors()
+    if TeamData._myAlliedColors then return TeamData._myAlliedColors end
+    local myColor = TeamData.getMyTeamColor()
+    local allies = {}
+    if myColor then
+        local folder = TeamSettings:FindFirstChild(myColor)
+        local alliesFolder = folder and folder:FindFirstChild("Allies")
+        if alliesFolder then
+            for _, a in ipairs(alliesFolder:GetChildren()) do
+                table.insert(allies, a.Name)
+            end
+        end
+    end
+    TeamData._myAlliedColors = allies
+    return allies
+end
 
--- TOP LEFT: Highlight Control
+function TeamData.isEnemy(colorName)
+    if colorName == nil then return false end
+    if colorName == TeamData.getMyTeamColor() then return false end
+    for _, ally in ipairs(TeamData.getMyAlliedColors()) do
+        if ally == colorName then return false end
+    end
+    return true
+end
+
+function TeamData.getColor(teamFolderOrName)
+    local name
+    if type(teamFolderOrName) == "string" then name = teamFolderOrName
+    elseif teamFolderOrName then name = teamFolderOrName.Name else return Color3.new(1,1,1) end
+    local cached = TeamData._teamColorByName[name]
+    if cached then return cached end
+
+    local ok, brick = pcall(BrickColor.new, name)
+    if ok and brick then
+        TeamData._teamColorByName[name] = brick.Color
+        return brick.Color
+    end
+    for _, team in ipairs(TeamsService:GetChildren()) do
+        if team.Name == name and team.TeamColor then
+            TeamData._teamColorByName[name] = team.TeamColor.Color
+            return team.TeamColor.Color
+        end
+        if team.TeamColor and team.TeamColor.Name == name then
+            TeamData._teamColorByName[name] = team.TeamColor.Color
+            return team.TeamColor.Color
+        end
+    end
+    TeamData._teamColorByName[name] = Color3.new(1,1,1)
+    return Color3.new(1,1,1)
+end
+
+function TeamData.getPlayerHistory(teamColor)
+    local cached = TeamData._playerHistory[teamColor]
+    if cached then return cached end
+    local folder = TeamSettings:FindFirstChild(teamColor)
+    local history = folder and folder:FindFirstChild("PlayerHistory")
+    local names = {}
+    if history then
+        for _, entry in ipairs(history:GetChildren()) do
+            table.insert(names, entry.Name)
+        end
+    end
+    TeamData._playerHistory[teamColor] = names
+    return names
+end
+
+function TeamData.getAllAlliances()
+    if TeamData._alliances then return TeamData._alliances end
+    local alliances, used = {}, {}
+    for _, teamFolder in ipairs(TeamSettings:GetChildren()) do
+        local color = teamFolder.Name
+        if not used[color] then
+            local list = { color }; used[color] = true
+            local alliesFolder = teamFolder:FindFirstChild("Allies")
+            if alliesFolder then
+                for _, ally in ipairs(alliesFolder:GetChildren()) do
+                    if TeamSettings:FindFirstChild(ally.Name) then
+                        table.insert(list, ally.Name); used[ally.Name] = true
+                    end
+                end
+            end
+            table.insert(alliances, list)
+        end
+    end
+    TeamData._alliances = alliances
+    return alliances
+end
+
+-- Invalidation wiring
+LocalPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function()
+    TeamData.invalidateMyTeam()
+end)
+
+TeamSettings.ChildAdded:Connect(function(child)
+    TeamData.invalidateAlliances()
+    TeamData.invalidateTeamColor(child.Name)
+    child.ChildAdded:Connect(function(sub)
+        if sub.Name == "Allies" then
+            TeamData.invalidateMyTeam(); TeamData.invalidateAlliances()
+        elseif sub.Name == "PlayerHistory" then
+            TeamData.invalidatePlayerHistory(child.Name)
+            sub.ChildAdded:Connect(function() TeamData.invalidatePlayerHistory(child.Name) end)
+            sub.ChildRemoved:Connect(function() TeamData.invalidatePlayerHistory(child.Name) end)
+        end
+    end)
+end)
+TeamSettings.ChildRemoved:Connect(function(child)
+    TeamData.invalidateAlliances()
+    TeamData.invalidateTeamColor(child.Name)
+    TeamData.invalidatePlayerHistory(child.Name)
+end)
+
+-- ============================================================
+-- GLOBAL RGB PROVIDER (shared by every ESP subsystem)
+-- ============================================================
+function getGlobalRGBColor()
+    local speed = Options.RGBSpeed and Options.RGBSpeed.Value or 1
+    return Color3.fromHSV((tick() * speed) % 1, 1, 1)
+end
+
+-- ============================================================
+-- NOTIFIER - one SendNotification helper
+-- ============================================================
+local Notifier = {}
+function Notifier.send(title, text, buttons, duration)
+    -- buttons: optional array of {label = string, callback = function}
+    local payload = { Title = title, Text = text, Duration = duration or 5 }
+    if buttons and buttons[1] then
+        payload.Button1 = buttons[1].label
+        local cb = Instance.new("BindableFunction")
+        cb.OnInvoke = function(btn)
+            for _, b in ipairs(buttons) do
+                if btn == b.label then b.callback(); return end
+            end
+        end
+        payload.Callback = cb
+    end
+    StarterGui:SetCore("SendNotification", payload)
+end
+
+
+
+
+-- Walk up the Roblox GUI hierarchy; returns false if any ancestor is hidden.
+local function isAncestorVisible(inst)
+    local cur = inst
+    while cur and cur ~= game do
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        cur = cur.Parent
+    end
+    return true
+end
+
+local function getLabelObject(lbl)
+    if not lbl then return nil end
+    return lbl.TextLabel or lbl.Object or lbl.Frame or lbl.Instance or lbl
+end
+
+local function labelIsVisible(lbl)
+    local obj = getLabelObject(lbl)
+    if not obj then return false end
+    if typeof(obj) == "Instance" and obj:IsA("GuiObject") then
+        return isAncestorVisible(obj)
+    end
+    return obj.Visible ~= false
+end
+
+
+
+
+
+
+
+
+
+
+-- ============================================================
+-- HIGHLIGHT MANAGER - one system, N sources
+-- styleFn(modelOrAdornee) -> fill, outline, fillTrans, outlineTrans
+-- ============================================================
+local HighlightManager = { active = {} }
+
+function HighlightManager.attach(adornee, styleFn)
+    local existing = HighlightManager.active[adornee]
+    if existing then existing.style = styleFn; return end
+    local h = Instance.new("Highlight")
+    h.Adornee = adornee
+    h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    h.Parent = adornee
+    HighlightManager.active[adornee] = { h = h, style = styleFn }
+    HighlightManager._apply(adornee, HighlightManager.active[adornee])
+end
+
+function HighlightManager.detach(adornee)
+    local entry = HighlightManager.active[adornee]
+    if entry then
+        if entry.h then entry.h:Destroy() end
+        HighlightManager.active[adornee] = nil
+    end
+end
+
+function HighlightManager._apply(adornee, entry)
+    local fill, outline, ft, ot = entry.style(adornee)
+    if not fill then return end
+    entry.h.FillColor = fill
+    entry.h.OutlineColor = outline
+    entry.h.FillTransparency = ft
+    entry.h.OutlineTransparency = ot
+end
+
+function HighlightManager.tick()
+    for adornee, entry in pairs(HighlightManager.active) do
+        if not adornee.Parent or not entry.h or not entry.h.Parent then
+            HighlightManager.detach(adornee)
+        else
+            HighlightManager._apply(adornee, entry)
+        end
+    end
+end
+
+function HighlightManager.detachAll()
+    for adornee in pairs(HighlightManager.active) do HighlightManager.detach(adornee) end
+end
+
+-- ============================================================
+-- ESP TAB UI
+-- ============================================================
 local ESP_Control = Tabs.ESP:AddLeftGroupbox('HIGHLIGHT CONTROL')
 
--- Remaining LEFT SIDE groupboxes
+ESP_Control:AddToggle('EnableHighlighter', { Text = 'Enable Highlighter', Default = false })
+ESP_Control:AddDropdown('HighlightMode', {
+    Values = { 'RGB', 'Team Color', 'Custom' }, Default = 'Team Color',
+    Multi = false, Text = 'Highlight Mode'
+})
+ESP_Control:AddLabel('Custom Fill'):AddColorPicker('HighlightCustomFillColor',
+    { Default = Color3.fromRGB(255,0,0), Title = 'Custom Fill Colour' })
+ESP_Control:AddLabel('Custom Outline'):AddColorPicker('HighlightCustomOutlineColor',
+    { Default = Color3.fromRGB(255,255,255), Title = 'Custom Outline Colour' })
+ESP_Control:AddSlider('HighlightTransparency',
+    { Text = 'Fill Transparency', Default = 0.5, Min = 0, Max = 1, Rounding = 2, Compact = false })
+ESP_Control:AddSlider('HighlightOutlineThickness',
+    { Text = 'Outline Thickness', Default = 1, Min = 0, Max = 1, Rounding = 2, Compact = false })
+
 local ESP_Soldiers   = Tabs.ESP:AddLeftGroupbox('SOLDIERS')
 local ESP_Air        = Tabs.ESP:AddLeftGroupbox('AIR')
 local ESP_Tanks      = Tabs.ESP:AddLeftGroupbox('TANKS')
 local ESP_Navy       = Tabs.ESP:AddLeftGroupbox('NAVY')
-
--- RIGHT SIDE
 local ESP_ProdBuilds = Tabs.ESP:AddRightGroupbox('PRODUCTION BUILDINGS')
 local ESP_Buildings  = Tabs.ESP:AddRightGroupbox('BUILDINGS')
 
--- Master toggle
-ESP_Control:AddToggle('EnableHighlighter', {
-    Text = 'Enable Highlighter',
-    Default = false
-})
+local function CreateESPUnitToggle(g, id, text) g:AddToggle(id, { Text = text, Default = false }) end
 
--- Highlight mode
-ESP_Control:AddDropdown('HighlightMode', {
-    Values = { 'RGB', 'Team Color', 'Custom' },
-    Default = 'Team Color',
-    Multi = false,
-    Text = 'Highlight Mode'
-})
+ESP_Soldiers:AddToggle('ESP_Soldiers_TeamCheck', { Text = 'Team Check', Default = true }); ESP_Soldiers:AddDivider()
+ESP_Air:AddToggle('ESP_Air_TeamCheck',          { Text = 'Team Check', Default = true }); ESP_Air:AddDivider()
+ESP_Tanks:AddToggle('ESP_Tanks_TeamCheck',      { Text = 'Team Check', Default = true }); ESP_Tanks:AddDivider()
+ESP_Navy:AddToggle('ESP_Navy_TeamCheck',        { Text = 'Team Check', Default = true }); ESP_Navy:AddDivider()
+ESP_ProdBuilds:AddToggle('ESP_Prod_TeamCheck',  { Text = 'Team Check', Default = true }); ESP_ProdBuilds:AddDivider()
+ESP_Buildings:AddToggle('ESP_Buildings_TeamCheck',{ Text = 'Team Check', Default = true }); ESP_Buildings:AddDivider()
 
--- Custom colours (separate fill and outline)
-ESP_Control:AddLabel('Custom Fill'):AddColorPicker('HighlightCustomFillColor', {
-    Default = Color3.fromRGB(255, 0, 0),
-    Title = 'Custom Fill Colour'
-})
-ESP_Control:AddLabel('Custom Outline'):AddColorPicker('HighlightCustomOutlineColor', {
-    Default = Color3.fromRGB(255, 255, 255),
-    Title = 'Custom Outline Colour'
-})
+CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_AntiAir_Enabled',      'Anti-Air Soldier')
+CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_Construction_Enabled', 'Construction Soldier')
+CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_Hovercraft_Enabled',   'Hovercraft')
+CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_Juggernaut_Enabled',   'Juggernaut')
+CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_Medic_Enabled',        'Medic')
+CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_Sniper_Enabled',       'Sniper')
 
--- Fill transparency
-ESP_Control:AddSlider('HighlightTransparency', {
-    Text = 'Fill Transparency',
-    Default = 0.5,
-    Min = 0,
-    Max = 1,
-    Rounding = 2,
-    Compact = false
-})
+CreateESPUnitToggle(ESP_Air, 'ESP_Air_Helicopter_Enabled',      'Helicopter')
+CreateESPUnitToggle(ESP_Air, 'ESP_Air_Mothership_Enabled',      'Mothership')
+CreateESPUnitToggle(ESP_Air, 'ESP_Air_SpaceFighter_Enabled',    'Space Fighter')
+CreateESPUnitToggle(ESP_Air, 'ESP_Air_StealthBomber_Enabled',   'Stealth Bomber')
+CreateESPUnitToggle(ESP_Air, 'ESP_Air_TransportPlane_Enabled',  'Transport Plane')
 
--- Outline thickness
-ESP_Control:AddSlider('HighlightOutlineThickness', {
-    Text = 'Outline Thickness',
-    Default = 1,
-    Min = 0,
-    Max = 1,
-    Rounding = 2,
-    Compact = false
-})
+CreateESPUnitToggle(ESP_Tanks, 'ESP_Tank_AntiAir_Enabled',    'Anti-Air Tank')
+CreateESPUnitToggle(ESP_Tanks, 'ESP_Tank_Explosive_Enabled',  'Explosive Tank')
+CreateESPUnitToggle(ESP_Tanks, 'ESP_Tank_Heavy_Enabled',      'Heavy Tank')
 
--- RGB Speed
-ESP_Control:AddSlider('HighlightRGBSpeed', {
-    Text = 'RGB Speed',
-    Default = 1,
-    Min = 0.1,
-    Max = 5,
-    Rounding = 1,
-    Compact = false
-})
+CreateESPUnitToggle(ESP_Navy, 'ESP_Navy_AircraftCarrier_Enabled', 'Aircraft Carrier')
+CreateESPUnitToggle(ESP_Navy, 'ESP_Navy_TransportShip_Enabled',   'Transport Ship')
 
--- RGB Smoothness (lower = smoother, controls update interval in seconds)
-ESP_Control:AddSlider('HighlightRGBSmoothness', {
-    Text = 'RGB Smoothness',
-    Default = 0.01,
-    Min = 0.005,
-    Max = 0.1,
-    Rounding = 3,
-    Compact = false
-})
+CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_Airport_Enabled',      'Airport')
+CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_Barracks_Enabled',     'Barracks')
+CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_Fort_Enabled',         'Fort')
+CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_Shipyard_Enabled',     'Shipyard')
+CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_SpaceLink_Enabled',    'Space Link')
+CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_TankFactory_Enabled',  'Tank Factory')
+CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_NuclearPlant_Enabled', 'Nuclear Plant')
+CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_PowerPlant_Enabled',   'Power Plant')
+
+CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_AntiAirTurret_Enabled',  'Anti-Air Turret')
+CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_CommandCenter_Enabled',  'Command Center')
+CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_Headquarters_Enabled',   'Headquarters')
+CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_NavalHouse_Enabled',     'Naval House')
+CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_PlaneHouse_Enabled',     'Plane House')
+CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_ShieldGen_Enabled',      'Shield Generator')
+CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_SoldierHouse_Enabled',   'Soldier House')
+CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_TankHouse_Enabled',      'Tank House')
+CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_Turret_Enabled',         'Turret')
 
 
--- Global RGB colour provider – used by highlighter, Nuke ESP, Silo ESP, and Predictor
-function getGlobalRGBColor()
-    local speed = Options.HighlightRGBSpeed and Options.HighlightRGBSpeed.Value or 1
-    local hue = (tick() * speed) % 1
-    return Color3.fromHSV(hue, 1, 1)
-end
-
-
--- HELPER: create a unit toggle without colour pickers
-local function CreateESPUnitToggle(groupbox, idPrefix, displayName)
-    groupbox:AddToggle(idPrefix .. "_Enabled", {
-        Text = displayName,
-        Default = false
-    })
-end
-
--- TEAM CHECKS PER GROUPBOX
-ESP_Soldiers:AddToggle('ESP_Soldiers_TeamCheck', { Text = 'Team Check', Default = true })
-ESP_Soldiers:AddDivider()
-ESP_Air:AddToggle('ESP_Air_TeamCheck', { Text = 'Team Check', Default = true })
-ESP_Air:AddDivider()
-ESP_Tanks:AddToggle('ESP_Tanks_TeamCheck', { Text = 'Team Check', Default = true })
-ESP_Tanks:AddDivider()
-ESP_Navy:AddToggle('ESP_Navy_TeamCheck', { Text = 'Team Check', Default = true })
-ESP_Navy:AddDivider()
-ESP_ProdBuilds:AddToggle('ESP_Prod_TeamCheck', { Text = 'Team Check', Default = true })
-ESP_ProdBuilds:AddDivider()
-ESP_Buildings:AddToggle('ESP_Buildings_TeamCheck', { Text = 'Team Check', Default = true })
-ESP_Buildings:AddDivider()
-
--- SOLDIERS
-CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_AntiAir', 'Anti-Air Soldier')
-CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_Construction', 'Construction Soldier')
-CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_Hovercraft', 'Hovercraft')
-CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_Juggernaut', 'Juggernaut')
-CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_Medic', 'Medic')
-CreateESPUnitToggle(ESP_Soldiers, 'ESP_Soldier_Sniper', 'Sniper')
-
--- AIR
-CreateESPUnitToggle(ESP_Air, 'ESP_Air_Helicopter', 'Helicopter')
-CreateESPUnitToggle(ESP_Air, 'ESP_Air_Mothership', 'Mothership')
-CreateESPUnitToggle(ESP_Air, 'ESP_Air_SpaceFighter', 'Space Fighter')
-CreateESPUnitToggle(ESP_Air, 'ESP_Air_StealthBomber', 'Stealth Bomber')
-CreateESPUnitToggle(ESP_Air, 'ESP_Air_TransportPlane', 'Transport Plane')
-
--- TANKS
-CreateESPUnitToggle(ESP_Tanks, 'ESP_Tank_AntiAir', 'Anti-Air Tank')
-CreateESPUnitToggle(ESP_Tanks, 'ESP_Tank_Explosive', 'Explosive Tank')
-CreateESPUnitToggle(ESP_Tanks, 'ESP_Tank_Heavy', 'Heavy Tank')
-
--- NAVY
-CreateESPUnitToggle(ESP_Navy, 'ESP_Navy_AircraftCarrier', 'Aircraft Carrier')
-CreateESPUnitToggle(ESP_Navy, 'ESP_Navy_TransportShip', 'Transport Ship')
-
--- PRODUCTION BUILDINGS
-CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_Airport', 'Airport')
-CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_Barracks', 'Barracks')
-CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_Fort', 'Fort')
-CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_Shipyard', 'Shipyard')
-CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_SpaceLink', 'Space Link')
-CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_TankFactory', 'Tank Factory')
-CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_NuclearPlant', 'Nuclear Plant')
-CreateESPUnitToggle(ESP_ProdBuilds, 'ESP_Prod_PowerPlant', 'Power Plant')
-
--- BUILDINGS
-CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_AntiAirTurret', 'Anti-Air Turret')
-CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_CommandCenter', 'Command Center')
-CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_Headquarters', 'Headquarters')
-CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_NavalHouse', 'Naval House')
-CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_PlaneHouse', 'Plane House')
-CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_ShieldGen', 'Shield Generator')
-CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_SoldierHouse', 'Soldier House')
-CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_TankHouse', 'Tank House')
-CreateESPUnitToggle(ESP_Buildings, 'ESP_Build_Turret', 'Turret')
-
--- Building Notifications GROUPBOX FOR BUILDINGS
-local NotifyGroup = Tabs.Main:AddRightGroupbox('Building Notifications')
-
-NotifyGroup:AddToggle('NotifyBuildings', {
-    Text = 'Notify Building Placements',
-    Default = false
-})
-
-NotifyGroup:AddToggle('TeamCheck', {
-    Text = 'Only Enemy Teams',
-    Default = true
-})
-
-NotifyGroup:AddDivider()
-
-NotifyGroup:AddToggle('Notify_Airport', { Text = 'Airport', Default = true })
-NotifyGroup:AddToggle('Notify_Barracks', { Text = 'Barracks', Default = true })
-NotifyGroup:AddToggle('Notify_Fort', { Text = 'Fort', Default = true })
-NotifyGroup:AddToggle('Notify_Shipyard', { Text = 'Naval Shipyard', Default = true })
-NotifyGroup:AddToggle('Notify_Nuke', { Text = 'Nuclear Silo', Default = true })
-NotifyGroup:AddToggle('Notify_ShieldGen', { Text = 'Shield Generator', Default = true })
-NotifyGroup:AddToggle('Notify_SpaceLink', { Text = 'Space Link', Default = true })
-NotifyGroup:AddToggle('Notify_TankFactory', { Text = 'Tank Factory', Default = true })
-
-
-
-
-function GetMyTeamColor()
-    return LocalPlayer.TeamColor and LocalPlayer.TeamColor.Name
-end
-
-function GetMyTeamSettingsFolder()
-    local myColor = GetMyTeamColor()
-    if not myColor then return nil end
-    return TeamSettings:FindFirstChild(myColor)
-end
-
-function GetMyAlliedColors()
-    local folder = GetMyTeamSettingsFolder()
-    if not folder then return {} end
-
-    local alliesFolder = folder:FindFirstChild("Allies")
-    if not alliesFolder then return {} end
-
-    local allies = {}
-    for _, ally in ipairs(alliesFolder:GetChildren()) do
-        table.insert(allies, ally.Name)
-    end
-
-    return allies
-end
-
-function IsEnemyTeamColor(colorName)
-    local myColor = GetMyTeamColor()
-    local allies = GetMyAlliedColors()
-
-    if colorName == myColor then
-        return false
-    end
-
-    for _, allyColor in ipairs(allies) do
-        if allyColor == colorName then
-            return false
-        end
-    end
-
-    return true
-end
-
-
-
-ActiveDisplays = ActiveDisplays or {}
-
-local HealthConnections = {}
-DirtyBuildings = DirtyBuildings or {} -- [building] = true
-
-local function MarkBuildingDirty(building)
-    if ActiveDisplays[building] then
-        DirtyBuildings[building] = true
-    end
-end
 
 
 -- ============================================================
--- UI LAYOUT CONSTANTS (no scaling, use UIScale only)
+-- RANGE INDICATOR - rings cloned from the game's own ring object,
+-- captured the first time you hover any friendly unit.
+-- Reuses TeamData.isEnemy for team checks.
 -- ============================================================
-local BASE_HP_BAR_WIDTH = 480
-local BASE_HP_BAR_HEIGHT = 32
-local BASE_ROW_HEIGHT = 80
-local BASE_PADDING = 8
-local BASE_TEXT_SIZE = 75
-local BASE_CONTAINER_WIDTH = 800
-local PROGRESS_BAR_WIDTH = 400
-local PROGRESS_BAR_HEIGHT = 24
+local RANGE_TABLE = {
+    ["Scout"]               = 12,
+    ["Light Soldier"]       = 15,
+    ["Heavy Soldier"]       = 15,
+    ["Repairman"]           = 10,
+    ["Anti-Air Soldier"]    = 16,
+    ["Sniper"]              = 23,
+    ["Juggernaut"]          = 15,
+    ["Medic"]               = 10,
+    ["Hovercraft"]          = 15,
 
--- Desired pixel density (pixels per stud)
-local PIXELS_PER_STUD = 400
+    ["Light Tank"]          = 16,
+    ["Heavy Tank"]          = 17,
+    ["Anti-Air Tank"]       = 18,
+    ["Artillery"]           = 32,
 
--- Maximum content size (in pixels) we want to fit without clipping
-local CANVAS_WIDTH = 1000
-local CANVAS_HEIGHT = 2000
+    ["Light Plane"]         = 15,
+    ["Heavy Plane"]         = 16,
+    ["Helicopter"]          = 14,
+    ["Stealth Bomber"]      = 13,
 
--- Part size derived to match canvas aspect ratio, keeping pixel density uniform
-local PART_SIZE = Vector3.new(
-    CANVAS_WIDTH / PIXELS_PER_STUD,
-    CANVAS_HEIGHT / PIXELS_PER_STUD,
-    1
-)  -- ≈ Vector3.new(2.5, 5, 1)
+    ["Space Fighter"]       = 16,
+    ["Mothership"]          = 18,
 
+    ["Destroyer"]           = 20,
+    ["Battleship"]          = 20,
+    ["Aircraft Carrier"]    = 27,
+    ["Gunboat"]             = 17.5,
+    ["Submarine"]           = 16,
 
-local function CalculateRequiredHeight(garrisonCount, productionCount)
-    local mode = GARRISON_MODE or "Detailed"
-    local prodMode = Options.ProductionMode and Options.ProductionMode.Value or "Detailed"
-    local garrisonRowHeight = (mode == "Simple") and (BASE_ROW_HEIGHT * 0.6) or BASE_ROW_HEIGHT
-    local productionRowHeight = BASE_ROW_HEIGHT * 0.7
-
-    local height = 0
-    if garrisonCount > 0 then
-        height = height + garrisonCount * garrisonRowHeight
-        height = height + (garrisonCount - 1) * BASE_PADDING
-    end
-    if productionCount > 0 then
-        height = height + productionCount * productionRowHeight
-        height = height + (productionCount - 1) * BASE_PADDING
-        height = height + PROGRESS_BAR_HEIGHT + 8
-    end
-    height = height + 20
-    return math.max(height, 100)
-end
-
-
--- ============================================================
--- === GARRISON VIEW GROUPBOX (FINAL ORDERED VERSION)        ===
--- ============================================================
-
-local GarrisonBox = Tabs.Main:AddRightGroupbox('Garrison View')
-
----------------------------------------------------------------
--- 1. GARRISON VIEW ON/OFF
----------------------------------------------------------------
-GarrisonBox:AddToggle('GarrisonViewEnabled', {
-    Text = 'Garrison View',
-    Default = true,
-    Tooltip = 'Enable or disable the entire garrison UI'
-}):OnChanged(function(val)
-    GARRISON_VIEW_ENABLED = val
-end)
-GARRISON_VIEW_ENABLED = true
-
----------------------------------------------------------------
--- TEAM COLORED TEXT TOGGLE
----------------------------------------------------------------
-GarrisonBox:AddToggle('GarrisonTeamColors', {
-    Text = 'Team Colored Text',
-    Default = false,
-    Tooltip = 'Color unit names based on team'
-}):OnChanged(function(val)
-    GARRISON_TEAM_COLORS = val
-
-    -- Mark all displays dirty so they rebuild with new color
-    for building in pairs(ActiveDisplays or {}) do
-        MarkBuildingDirty(building)
-    end
-end)
-GARRISON_TEAM_COLORS = false
-
----------------------------------------------------------------
--- 2. IGNORE TARGET (MULTISELECT DROPDOWN)
----------------------------------------------------------------
-GarrisonBox:AddDropdown('IgnoreTargets', {
-    Values = { 'Self', 'Own Team' },
-    Default = {},
-    Multi = true,
-    Text = 'Ignore Target',
-    Tooltip = 'Choose which targets to ignore'
-}):OnChanged(function(selected)
-    IGNORE_SELF = selected['Self'] == true
-    IGNORE_TEAM = selected['Own Team'] == true
-end)
-IGNORE_SELF = false
-IGNORE_TEAM = false
-
----------------------------------------------------------------
--- 3. MODE (SIMPLE / DETAILED)
----------------------------------------------------------------
-GarrisonBox:AddDropdown('GarrisonMode', {
-    Values = { 'Simple', 'Detailed' },
-    Default = 'Detailed',
-    Multi = false,
-    Text = 'Mode',
-    Tooltip = 'Choose how much information to show'
-}):OnChanged(function(val)
-    GARRISON_MODE = val
-
-    -- Mark all displays dirty so they rebuild with new mode and resized canvas
-    for building in pairs(ActiveDisplays or {}) do
-        MarkBuildingDirty(building)
-    end
-end)
-
----------------------------------------------------------------
--- 4. DISTANCE CHECK ON/OFF
----------------------------------------------------------------
-GarrisonBox:AddToggle('DistanceCheckEnabled', {
-    Text = 'Distance Check',
-    Default = false,
-    Tooltip = 'Hide garrison UI for buildings beyond the distance'
-}):OnChanged(function(val)
-    DISTANCE_CHECK_ENABLED = val
-end)
-DISTANCE_CHECK_ENABLED = false
-
----------------------------------------------------------------
--- 4b. DISTANCE SLIDER (0–500)
----------------------------------------------------------------
-GarrisonBox:AddSlider('MaxDistance', {
-    Text = 'Max Distance',
-    Default = 250,
-    Min = 0,
-    Max = 500,
-    Rounding = 0,
-    Compact = false
-}):OnChanged(function(val)
-    MAX_DISTANCE = val
-end)
-MAX_DISTANCE = 250
-
----------------------------------------------------------------
--- 5. DISABLE WHEN NEARBY ON/OFF
----------------------------------------------------------------
-GarrisonBox:AddToggle('DisableNearby', {
-    Text = 'Disable When Nearby',
-    Default = false,
-    Tooltip = 'Hide UI when you are too close to the building'
-}):OnChanged(function(val)
-    DISABLE_NEARBY = val
-end)
-DISABLE_NEARBY = false
-
----------------------------------------------------------------
--- 5b. NEARBY SLIDER (0–100)
----------------------------------------------------------------
-GarrisonBox:AddSlider('NearbyDistance', {
-    Text = 'Nearby Distance',
-    Default = 25,
-    Min = 0,
-    Max = 100,
-    Rounding = 0,
-    Compact = false
-}):OnChanged(function(val)
-    NEARBY_DISTANCE = val
-end)
-NEARBY_DISTANCE = 25
-
----------------------------------------------------------------
--- 6. HEIGHT SLIDER
----------------------------------------------------------------
-GarrisonBox:AddSlider('GarrisonHeight', {
-    Text = 'Height Offset',
-    Default = 0,
-    Min = -30,
-    Max = 30,
-    Rounding = 1,
-    Compact = false
-}):OnChanged(function(val)
-    CURRENT_HEIGHT_OFFSET = val
-end)
-CURRENT_HEIGHT_OFFSET = 0
-
----------------------------------------------------------------
--- 7. SCALE SLIDER
----------------------------------------------------------------
-GarrisonBox:AddSlider('GarrisonScale', {
-    Text = 'Scale',
-    Default = 1.0,
-    Min = 0.5,
-    Max = 10.36,
-    Rounding = 2,
-    Compact = false
-}):OnChanged(function(val)
-    CURRENT_SCALE = val
-
-    -- Update UIScale, part size, and canvas size for every display
-    for building, display in pairs(ActiveDisplays or {}) do
-        if display.uiScale then
-            display.uiScale.Scale = val
-        end
-        if display.part then
-            display.part.Size = Vector3.new(
-                (CANVAS_WIDTH / PIXELS_PER_STUD) * val,
-                ((display.requiredHeight or 100) / PIXELS_PER_STUD) * val,
-                1
-            )
-        end
-        if display.gui then
-            display.gui.CanvasSize = Vector2.new(
-                CANVAS_WIDTH * val,
-                (display.requiredHeight or 100) * val
-            )
-        end
-    end
-end)
-
----------------------------------------------------------------
--- PRODUCTION VIEW CONTROLS
----------------------------------------------------------------
-GarrisonBox:AddToggle('ProductionViewEnabled', {
-    Text = 'Show Production',
-    Default = false,
-    Tooltip = 'Display production queue above/below garrison units'
-})
-
-GarrisonBox:AddDropdown('ProductionMode', {
-    Values = { 'Simple', 'Detailed' },
-    Default = 'Detailed',
-    Multi = false,
-    Text = 'Production Mode'
-})
-
-GarrisonBox:AddDropdown('ProductionPosition', {
-    Values = { 'Above Garrison', 'Below Garrison' },
-    Default = 'Below Garrison',
-    Multi = false,
-    Text = 'Production Position'
-})
-
-
-
-
-
-CURRENT_SCALE = 1.0
-
-
-
-Toggles.ProductionViewEnabled:OnChanged(function(val)
-    if val then
-        -- Turn on: rebuild displays with production
-        for building in pairs(ActiveDisplays or {}) do
-            MarkBuildingDirty(building)
-        end
-    else
-        -- Turn off: clear all production frames immediately
-        for building, display in pairs(ActiveDisplays or {}) do
-            if display.productionFrame then
-                display.productionFrame:ClearAllChildren()
-            end
-            if display.productionConnections then
-                for _, conn in ipairs(display.productionConnections) do
-                    conn:Disconnect()
-                end
-                display.productionConnections = {}
-            end
-            display.activeProduction = nil
-            if display.separator then
-                display.separator.Visible = false
-            end
-            -- Resize the part after the function is defined (deferred)
-            task.defer(function()
-                if display and display.part then
-                    UpdateDisplaySize(display)
-                end
-            end)
-        end
-    end
-end)
-
-Options.ProductionMode:OnChanged(function()
-    for building in pairs(ActiveDisplays) do
-        MarkBuildingDirty(building)
-    end
-end)
-
-Options.ProductionPosition:OnChanged(function(val)
-    for building, display in pairs(ActiveDisplays or {}) do
-        if display.garrisonFrame and display.productionFrame then
-            if val == 'Above Garrison' then
-                display.productionFrame.LayoutOrder = 1
-                display.garrisonFrame.LayoutOrder = 2
-            else
-                display.garrisonFrame.LayoutOrder = 1
-                display.productionFrame.LayoutOrder = 2
-            end
-        end
-        MarkBuildingDirty(building)
-    end
-end)
-
-
-
-
--- TEAM COLOR FOR GARRISON TEXT
-local function GetTeamColorForFolder(teamFolder)
-    if not teamFolder then
-        return Color3.new(1, 1, 1)
-    end
-
-    -- Try BrickColor
-    local ok, brick = pcall(BrickColor.new, teamFolder.Name)
-    if ok and brick then
-        return brick.Color
-    end
-
-    -- Try actual Teams
-    local TeamsService = game:GetService("Teams")
-    for _, team in ipairs(TeamsService:GetChildren()) do
-        if team.Name == teamFolder.Name then
-            if team.TeamColor then
-                return team.TeamColor.Color
-            end
-        end
-
-        if team.TeamColor and team.TeamColor.Name == teamFolder.Name then
-            return team.TeamColor.Color
-        end
-    end
-
-    return Color3.new(1, 1, 1)
-end
-
--- ============================================================
--- === GARRISON SYSTEM — LINORIA-INTEGRATED VERSION         ===
--- ============================================================
-
-
-
--- Which buildings can have garrison UI
-local Garrisonable = {
-    ["Bunker"] = true,
-    ["Headquarters"] = true,
-    ["Command Center"] = true,
-    ["Fort"] = true,
-    ["Medi-Truck"] = true,
-    ["Aircraft Carrier"] = true,
-    ["Transport Ship"] = true,
-    ["Transport Plane"] = true,
-    ["Mothership"] = true,
-    ["Helicopter"] = true
+    ["Turret"]              = 16,
+    ["Anti-Air Turret"]     = 20,
+    ["Fort"]                = 25,
+    ["Command Center"]      = 27,
+    ["Headquarters"]        = 27,
 }
 
+-- Category lookup: which group each unit belongs to
+local RANGE_CATEGORY = {
+    -- Soldiers
+    ["Scout"]               = "Soldiers",
+    ["Light Soldier"]       = "Soldiers",
+    ["Heavy Soldier"]       = "Soldiers",
+    ["Repairman"]           = "Soldiers",
+    ["Anti-Air Soldier"]    = "Soldiers",
+    ["Sniper"]              = "Soldiers",
+    ["Juggernaut"]          = "Soldiers",
+    ["Medic"]               = "Soldiers",
+    ["Hovercraft"]          = "Soldiers",
+
+    -- Tanks
+    ["Light Tank"]          = "Tanks",
+    ["Heavy Tank"]          = "Tanks",
+    ["Anti-Air Tank"]       = "Tanks",
+    ["Artillery"]           = "Tanks",
+
+    -- Planes
+    ["Light Plane"]         = "Planes",
+    ["Heavy Plane"]         = "Planes",
+    ["Helicopter"]          = "Planes",
+    ["Stealth Bomber"]      = "Planes",
+
+    -- Space
+    ["Space Fighter"]       = "Space",
+    ["Mothership"]          = "Space",
+
+    -- Naval
+    ["Destroyer"]           = "Naval",
+    ["Battleship"]          = "Naval",
+    ["Aircraft Carrier"]    = "Naval",
+    ["Gunboat"]             = "Naval",
+    ["Submarine"]           = "Naval",
+
+    -- Defense
+    ["Turret"]              = "Defense",
+    ["Anti-Air Turret"]     = "Defense",
+    ["Fort"]                = "Defense",
+    ["Command Center"]      = "Defense",
+    ["Headquarters"]        = "Defense",
+}
+
+local RangeIndicator = {
+    enabled      = false,
+    ignoreSelf   = true,
+    ignoreTeam   = true,
+    distanceCheck  = false,
+    maxDistance    = 250,
+    disableNearby  = false,
+    nearbyDistance = 25,
+    categories   = {
+        Soldiers = true, Tanks = true, Planes = true,
+        Space    = true, Naval = true, Defense = true,
+    },
+    storedTemplate = nil,
+    -- Original template colours, saved on capture for "Default" mode
+    defaultOuter       = nil,
+    defaultInnerPart   = nil,
+    defaultInnerDecal  = nil,
+    ringsByUnit  = {},
+}
+
+-- Capture the game's ring template on first hover
+task.spawn(function()
+    while not RangeIndicator.storedTemplate do
+        local root   = workspace:FindFirstChild("jliiIij")
+        local inner  = root and root:FindFirstChild("jlIilij")
+        local ring   = inner and inner:FindFirstChild("Ring")
+        local inside = inner and inner:FindFirstChild("Inside")
+        if ring and inside then
+            RangeIndicator.storedTemplate = inner:Clone()
+            RangeIndicator.storedTemplate.Parent = nil
+
+            -- Save original colours from the live game template
+            RangeIndicator.defaultOuter = ring.Color
+            RangeIndicator.defaultInnerPart = inside.Color
+            local decal = inside:FindFirstChildOfClass("Decal")
+            RangeIndicator.defaultInnerDecal = decal and decal.Color3 or Color3.new(1,1,1)
+
+            print("[RangeIndicator] template captured")
+            if RangeIndicator.enabled then
+                task.defer(function() RangeIndicator.rescan() end)
+            end
+            return
+        end
+        task.wait(0.25)
+    end
+end)
+
+local function modelBottomY(model)
+    local ok, cf, size = pcall(function() return model:GetBoundingBox() end)
+    if ok and cf then return cf.Position.Y - size.Y / 2 end
+    local torso = model:FindFirstChild("Torso") or model:FindFirstChildWhichIsA("BasePart")
+    return torso and torso.Position.Y or 0
+end
+
+function RangeIndicator.attach(unit)
+    if not RangeIndicator.storedTemplate then return end
+    if RangeIndicator.ringsByUnit[unit] then return end
+    if not unit:IsA("Model") then return end
+    local r = RANGE_TABLE[unit.Name]
+    if not r then return end
+    local torso = unit:FindFirstChild("Torso") or unit:FindFirstChildWhichIsA("BasePart")
+    if not torso then return end
+
+    if RangeIndicator.ignoreSelf or RangeIndicator.ignoreTeam then
+        local tf = unit.Parent
+        if not tf or not tf.Parent or tf.Parent ~= TeamsFolder then return end
+        local bTeam = tf.Name
+        local myTeam = TeamData.getMyTeamColor()
+        local isOwner = (bTeam == myTeam)
+        local sameTeam = isOwner
+        if not sameTeam then
+            for _, ally in ipairs(TeamData.getMyAlliedColors()) do
+                if ally == bTeam then sameTeam = true; break end
+            end
+        end
+        if RangeIndicator.ignoreSelf and isOwner then return end
+        if RangeIndicator.ignoreTeam and sameTeam and not isOwner then return end
+    end
+	
+	    local cat = RANGE_CATEGORY[unit.Name]
+    if cat and not RangeIndicator.categories[cat] then return end
+
+    local ring = RangeIndicator.storedTemplate:Clone()
+    ring.Name = "RangeRing"
+    ring.Parent = workspace
+
+    local entry = { ring = ring, parts = {}, outerPart = nil, innerPart = nil, innerDecal = nil, unit = unit }
+    local bottomY = modelBottomY(unit)
+
+    for _, part in ipairs(ring:GetChildren()) do
+        if part:IsA("BasePart") then
+            part.Anchored    = true
+            part.CanCollide  = false
+            part.CanQuery    = false
+            part.CanTouch    = false
+            part.Massless    = true
+            part.CastShadow  = false
+
+            part.Size = Vector3.new(r * 2, part.Size.Y * 0.6, r * 2)
+            local y = bottomY + part.Size.Y / 2
+            local rot = part.CFrame - part.CFrame.Position
+            part.CFrame = CFrame.new(torso.Position.X, y, torso.Position.Z) * rot
+
+            table.insert(entry.parts, { part = part, rot = rot })
+
+            if part.Name == "Ring" then
+                entry.outerPart = part
+            elseif part.Name == "Inside" then
+                entry.innerPart = part
+                entry.innerDecal = part:FindFirstChildOfClass("Decal")
+            end
+        end
+    end
+
+    entry.yOffset = bottomY - torso.Position.Y
+    entry.hidden = false
+    RangeIndicator.applyColors(entry)
+    RangeIndicator.ringsByUnit[unit] = entry
+end
+
+-- Resolve the target colours for the active mode and stamp them on the ring.
+function RangeIndicator.applyColors(entry)
+    if not entry or not entry.outerPart then return end
+    local mode = Options.RangeColorMode and Options.RangeColorMode.Value or 'Default'
+    local outerCol, innerCol
+
+    if mode == 'Default' then
+        outerCol = RangeIndicator.defaultOuter or Color3.new(1, 0, 0)
+        innerCol = RangeIndicator.defaultInnerDecal or Color3.new(1, 1, 1)
+    elseif mode == 'Team Colors' then
+        local tf = entry.unit and entry.unit.Parent
+        local col = (tf and TeamData.getColor(tf.Name)) or Color3.new(1, 0, 0)
+        outerCol, innerCol = col, col
+    elseif mode == 'Custom' then
+        outerCol = Options.RangeOuterColor.Value
+        innerCol = Options.RangeInnerColor.Value
+    elseif mode == 'RGB' then
+        local rgb = getGlobalRGBColor()
+        outerCol, innerCol = rgb, rgb
+    end
+
+    entry.outerPart.Color = outerCol
+    if entry.innerPart then
+        entry.innerPart.Color = innerCol
+    end
+    if entry.innerDecal then
+        entry.innerDecal.Color3 = innerCol
+    end
+end
+
+function RangeIndicator.detach(unit)
+    local e = RangeIndicator.ringsByUnit[unit]
+    if e then
+        if e.ring and e.ring.Parent then e.ring:Destroy() end
+        RangeIndicator.ringsByUnit[unit] = nil
+    end
+end
+
+function RangeIndicator.clearAll()
+    for unit in pairs(RangeIndicator.ringsByUnit) do
+        RangeIndicator.detach(unit)
+    end
+end
+
+function RangeIndicator.rescan()
+    RangeIndicator.clearAll()
+    if not RangeIndicator.enabled then return end
+    for _, tf in ipairs(TeamsFolder:GetChildren()) do
+        for _, m in ipairs(tf:GetChildren()) do
+            if m:IsA("Model") and RANGE_TABLE[m.Name] then
+                RangeIndicator.attach(m)
+            end
+        end
+    end
+end
+
+function RangeIndicator.onAdded(desc)
+    if not RangeIndicator.enabled then return end
+    if not desc:IsA("Model") then return end
+    if not desc.Parent or desc.Parent.Parent ~= TeamsFolder then return end
+
+    if RANGE_TABLE[desc.Name] then
+        RangeIndicator.attach(desc)
+    else
+        -- name may be a placeholder that gets renamed shortly
+        local conn
+        conn = desc:GetPropertyChangedSignal("Name"):Connect(function()
+            if RANGE_TABLE[desc.Name] then
+                conn:Disconnect()
+                if RangeIndicator.enabled then RangeIndicator.attach(desc) end
+            end
+        end)
+        task.delay(5, function()
+            if conn.Connected then conn:Disconnect() end
+        end)
+    end
+end
+
+-- Reconciles the ring list with reality:
+--   * drops rings for units that left Teams (garrisoned, destroyed)
+--   * attaches rings to units we're missing (re-deployed, renamed late)
+-- Cheap: one pass over Teams per call, short-circuits fast when nothing changed.
+function RangeIndicator.maintain()
+    if not RangeIndicator.enabled then return end
+    if not RangeIndicator.storedTemplate then return end
+
+    -- Detach any unit that's no longer a live descendant of Teams
+    for unit in pairs(RangeIndicator.ringsByUnit) do
+        if not unit.Parent or not unit:IsDescendantOf(TeamsFolder) then
+            RangeIndicator.detach(unit)
+        end
+    end
+
+    -- Attach any unit we're missing
+    for _, tf in ipairs(TeamsFolder:GetChildren()) do
+        for _, m in ipairs(tf:GetChildren()) do
+            if m:IsA("Model")
+               and RANGE_TABLE[m.Name]
+               and not RangeIndicator.ringsByUnit[m] then
+                RangeIndicator.attach(m)
+            end
+        end
+    end
+end
 
 
----------------------------------------------------------------
--- HEALTH BAR
----------------------------------------------------------------
+function RangeIndicator.followTick()
+    if next(RangeIndicator.ringsByUnit) == nil then return end
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local camPos = cam.CFrame.Position
+    local doDist = RangeIndicator.distanceCheck
+    local maxD   = RangeIndicator.maxDistance
+    local doNear = RangeIndicator.disableNearby
+    local nearD  = RangeIndicator.nearbyDistance
+    local rgb    = (Options.RangeColorMode and Options.RangeColorMode.Value == 'RGB')
+
+    local dead = nil
+    for unit, entry in pairs(RangeIndicator.ringsByUnit) do
+        if not unit.Parent then
+            dead = dead or {}
+            table.insert(dead, unit)
+        else
+            local torso = unit:FindFirstChild("Torso") or unit:FindFirstChildWhichIsA("BasePart")
+            if torso then
+                local dist = (camPos - torso.Position).Magnitude
+                local shouldHide = (doDist and dist > maxD) or (doNear and dist < nearD)
+
+                -- Toggle visibility by parenting the ring model in/out of workspace
+                if shouldHide and not entry.hidden then
+                    if entry.ring then entry.ring.Parent = nil end
+                    entry.hidden = true
+                elseif not shouldHide and entry.hidden then
+                    if entry.ring then entry.ring.Parent = workspace end
+                    entry.hidden = false
+                end
+
+                -- Only update positions while visible
+                if not entry.hidden then
+                    local x, z = torso.Position.X, torso.Position.Z
+                    local baseY = torso.Position.Y + (entry.yOffset or 0)
+                    for _, e in ipairs(entry.parts) do
+                        local part = e.part
+                        local y = baseY + part.Size.Y / 2
+                        part.CFrame = CFrame.new(x, y, z) * e.rot
+                    end
+                    if rgb then
+                        RangeIndicator.applyColors(entry)
+                    end
+                end
+            end
+        end
+    end
+    if dead then
+        for _, unit in ipairs(dead) do
+            RangeIndicator.detach(unit)
+        end
+    end
+end
+
+
+
+
+-- ============================================================
+-- NUKE TAB UI
+-- ============================================================
+local PredictorGroup = Tabs.Nuke:AddLeftGroupbox('Nuke Predictor')
+PredictorGroup:AddToggle('PredictorEnabled', { Text = 'Enable Predictor', Default = true })
+PredictorGroup:AddToggle('PathwayEnabled',   { Text = 'Show Pathway', Default = false })
+PredictorGroup:AddDropdown('PathwayDisappear',
+    { Values = { 'On Apex', 'On Impact' }, Default = 'On Apex', Multi = false, Text = 'Pathway Disappears' })
+PredictorGroup:AddDropdown('MarkerColorMode',
+    { Values = { 'Custom', 'RGB' }, Default = 'Custom', Multi = false, Text = 'Marker Color Mode' })
+PredictorGroup:AddLabel('Marker Custom Color'):AddColorPicker('PredictorColor',
+    { Default = Color3.fromRGB(255,0,0), Title = 'Prediction Marker Custom' })
+PredictorGroup:AddLabel('Pathway Color'):AddColorPicker('PathwayColor',
+    { Default = Color3.fromRGB(255,0,0), Title = 'Pathway Line Color' })
+PredictorGroup:AddSlider('PredictorStayTime',
+    { Text = 'Stay Time (s)', Default = 0, Min = 0, Max = 10, Rounding = 0, Compact = false })
+
+local NukeMiscGroup = Tabs.Nuke:AddLeftGroupbox('Nuke Misc')
+NukeMiscGroup:AddToggle('NotifyNukeLaunch',    { Text = 'Notify Nuke Launch', Default = false })
+NukeMiscGroup:AddToggle('NotifyNukeTeamCheck', { Text = 'Team Check', Default = true })
+NukeMiscGroup:AddLabel('Launch Alert Sound')
+NukeMiscGroup:AddDropdown('AlertSound', {
+    Values = { 'None', 'UTHINKIMDUMB', 'LLTNT', 'NEW YEAR NEW ME', 'BHAJLSC', 'DOAFTCS',
+               'HOW U MAKE OAT MEAL', 'FACTORIO', 'FACTORIO OLD', 'LELOUCH', 'NEOH' },
+    Default = 'UTHINKIMDUMB', Multi = false, Text = 'Alert Sound'
+})
+NukeMiscGroup:AddButton('Test Sound', function()
+    playSound(Options.AlertSound.Value, Options.AlertVolume.Value)
+end)
+NukeMiscGroup:AddSlider('AlertVolume',
+    { Text = 'Volume', Default = 1, Min = 0, Max = 1.5, Rounding = 2, Compact = false })
+
+-- Silo ESP
+local SiloESPGroup = Tabs.Nuke:AddRightGroupbox('Silo ESP')
+SiloESPGroup:AddToggle('SiloESPEnabled',     { Text = 'Enable Silo ESP', Default = false })
+SiloESPGroup:AddToggle('SiloESPTeamCheck',   { Text = 'Team Check', Default = true })
+SiloESPGroup:AddToggle('SiloESPIgnoreLocal', { Text = 'Ignore Local', Default = true })
+SiloESPGroup:AddLabel('Silo Colors'); SiloESPGroup:AddDivider()
+SiloESPGroup:AddDropdown('SiloColorMode', {
+    Values = { 'Team Color', 'Custom', 'RGB', 'Green, Yellow, Red - No Nuke, Producing, Nuke' },
+    Default = 'Team Color', Multi = false, Text = 'Silo Color Mode'
+})
+SiloESPGroup:AddLabel('Silo Outline'):AddColorPicker('SiloOutlineColor',
+    { Default = Color3.fromRGB(255,100,100), Title = 'Silo Outline' })
+SiloESPGroup:AddLabel('Silo Inner'):AddColorPicker('SiloInnerColor',
+    { Default = Color3.fromRGB(255,0,0), Title = 'Silo Inner' })
+SiloESPGroup:AddSlider('SiloOutlineThickness',
+    { Text = 'Silo Outline Thickness', Default = 1, Min = 0, Max = 1, Rounding = 2, Compact = false })
+
+-- Nuke ESP
+local NukeESPGroup = Tabs.Nuke:AddRightGroupbox('Nuke ESP')
+NukeESPGroup:AddToggle('NukeESPEnabled',     { Text = 'Enable Nuke ESP', Default = false })
+NukeESPGroup:AddToggle('NukeESPTeamCheck',   { Text = 'Team Check', Default = true })
+NukeESPGroup:AddToggle('NukeESPIgnoreLocal', { Text = 'Ignore Local', Default = true })
+
+NukeESPGroup:AddLabel('Idle Missile Colors'); NukeESPGroup:AddDivider()
+NukeESPGroup:AddDropdown('IdleColorMode',
+    { Values = { 'Team Color', 'Custom', 'RGB' }, Default = 'Team Color', Multi = false, Text = 'Idle Color Mode' })
+NukeESPGroup:AddLabel('Idle Outline'):AddColorPicker('IdleOutlineColor',
+    { Default = Color3.fromRGB(255,100,100), Title = 'Idle Outline' })
+NukeESPGroup:AddLabel('Idle Inner'):AddColorPicker('IdleInnerColor',
+    { Default = Color3.fromRGB(255,0,0), Title = 'Idle Inner' })
+NukeESPGroup:AddSlider('IdleOutlineThickness',
+    { Text = 'Idle Outline Thickness', Default = 1, Min = 0, Max = 1, Rounding = 2, Compact = false })
+
+NukeESPGroup:AddLabel('Moving Missile Colors'); NukeESPGroup:AddDivider()
+NukeESPGroup:AddDropdown('MovingColorMode',
+    { Values = { 'Team Color', 'Custom', 'RGB' }, Default = 'Team Color', Multi = false, Text = 'Moving Color Mode' })
+NukeESPGroup:AddLabel('Moving Outline'):AddColorPicker('MovingOutlineColor',
+    { Default = Color3.fromRGB(100,100,255), Title = 'Moving Outline' })
+NukeESPGroup:AddLabel('Moving Inner'):AddColorPicker('MovingInnerColor',
+    { Default = Color3.fromRGB(0,0,255), Title = 'Moving Inner' })
+NukeESPGroup:AddSlider('MovingOutlineThickness',
+    { Text = 'Moving Outline Thickness', Default = 1, Min = 0, Max = 1, Rounding = 2, Compact = false })
+
+-- ============================================================
+-- NUKE INFO TAB (was Nuclear)
+-- ============================================================
+local NI_Alliance1 = Tabs.NukeInfo:AddLeftGroupbox("Alliance 1")
+local NI_Alliance2 = Tabs.NukeInfo:AddLeftGroupbox("Alliance 2")
+local NI_Alliance3 = Tabs.NukeInfo:AddRightGroupbox("Alliance 3")
+local NI_Groups    = { NI_Alliance1, NI_Alliance2, NI_Alliance3 }
+local NI_Labels    = {}
+for i, g in ipairs(NI_Groups) do NI_Labels[i] = g:AddLabel("Loading nuclear data...", true) end
+
+local function ResizeBox(label, groupbox)
+    task.defer(function()
+        local text = label.Text or ""
+        local _, nl = text:gsub("\n", "")
+        local h = 20 + ((nl + 1) * 14)
+        local container = groupbox.Container or (groupbox.Frame and groupbox.Frame.Container)
+        if container then container.Size = UDim2.new(1, 0, 0, h) end
+    end)
+end
+
+-- ============================================================
+-- PLAYER INFO TAB
+-- ============================================================
+local PI_Alliance1 = Tabs.PlayerInfo:AddLeftGroupbox("Alliance 1")
+local PI_Alliance2 = Tabs.PlayerInfo:AddLeftGroupbox("Alliance 2")
+local PI_Alliance3 = Tabs.PlayerInfo:AddRightGroupbox("Alliance 3")
+local PI_Groups    = { PI_Alliance1, PI_Alliance2, PI_Alliance3 }
+local PI_Labels    = {}
+for i, g in ipairs(PI_Groups) do PI_Labels[i] = g:AddLabel("Loading player data...", true) end
+
+-- ============================================================
+-- NOTIFICATIONS TAB
+-- ============================================================
+local NotifyGroup = Tabs.Notifications:AddLeftGroupbox('Building Notifications')
+NotifyGroup:AddToggle('NotifyBuildings', { Text = 'Notify Building Placements', Default = false })
+NotifyGroup:AddToggle('NotifyTeamCheck', { Text = 'Only Enemy Teams', Default = true })
+NotifyGroup:AddDivider()
+NotifyGroup:AddToggle('Notify_Airport',      { Text = 'Airport', Default = true })
+NotifyGroup:AddToggle('Notify_Barracks',     { Text = 'Barracks', Default = true })
+NotifyGroup:AddToggle('Notify_Fort',         { Text = 'Fort', Default = true })
+NotifyGroup:AddToggle('Notify_Shipyard',     { Text = 'Naval Shipyard', Default = true })
+NotifyGroup:AddToggle('Notify_Nuke',         { Text = 'Nuclear Silo', Default = true })
+NotifyGroup:AddToggle('Notify_ShieldGen',    { Text = 'Shield Generator', Default = true })
+NotifyGroup:AddToggle('Notify_SpaceLink',    { Text = 'Space Link', Default = true })
+NotifyGroup:AddToggle('Notify_TankFactory',  { Text = 'Tank Factory', Default = true })
+
+-- ============================================================
+-- GARRISON TAB
+-- ============================================================
+local GarrisonBox = Tabs.Garrison:AddLeftGroupbox('Garrison View')
+
+GarrisonBox:AddToggle('GarrisonViewEnabled', {
+    Text = 'Garrison View', Default = true,
+    Tooltip = 'Enable or disable the entire garrison UI'
+})
+GARRISON_VIEW_ENABLED = true
+GarrisonBox:AddToggle('GarrisonTeamColors', {
+    Text = 'Team Colored Text', Default = false, Tooltip = 'Color unit names based on team'
+})
+GARRISON_TEAM_COLORS = false
+GarrisonBox:AddDropdown('IgnoreTargets', {
+    Values = { 'Self', 'Own Team' }, Default = {}, Multi = true,
+    Text = 'Ignore Target', Tooltip = 'Choose which targets to ignore'
+})
+IGNORE_SELF = false; IGNORE_TEAM = false
+GarrisonBox:AddDropdown('GarrisonMode', {
+    Values = { 'Simple', 'Detailed' }, Default = 'Detailed', Multi = false,
+    Text = 'Mode', Tooltip = 'Choose how much information to show'
+})
+GarrisonBox:AddToggle('DistanceCheckEnabled', { Text = 'Distance Check', Default = false })
+DISTANCE_CHECK_ENABLED = false
+GarrisonBox:AddSlider('MaxDistance',
+    { Text = 'Max Distance', Default = 250, Min = 0, Max = 500, Rounding = 0, Compact = false })
+MAX_DISTANCE = 250
+GarrisonBox:AddToggle('DisableNearby', { Text = 'Disable When Nearby', Default = false })
+DISABLE_NEARBY = false
+GarrisonBox:AddSlider('NearbyDistance',
+    { Text = 'Nearby Distance', Default = 25, Min = 0, Max = 100, Rounding = 0, Compact = false })
+NEARBY_DISTANCE = 25
+GarrisonBox:AddSlider('GarrisonHeight',
+    { Text = 'Height Offset', Default = 0, Min = -30, Max = 30, Rounding = 1, Compact = false })
+CURRENT_HEIGHT_OFFSET = 0
+GarrisonBox:AddSlider('GarrisonScale',
+    { Text = 'Scale', Default = 1.0, Min = 0.5, Max = 10.36, Rounding = 2, Compact = false })
+CURRENT_SCALE = 1.0
+
+GarrisonBox:AddToggle('ProductionViewEnabled',
+    { Text = 'Show Production', Default = false, Tooltip = 'Display production queue' })
+GarrisonBox:AddDropdown('ProductionMode',
+    { Values = { 'Simple', 'Detailed' }, Default = 'Detailed', Multi = false, Text = 'Production Mode' })
+GarrisonBox:AddDropdown('ProductionPosition',
+    { Values = { 'Above Garrison', 'Below Garrison' }, Default = 'Below Garrison', Multi = false,
+      Text = 'Production Position' })
+	  
+	  -- Right-side groupbox in Misc tab
+local RangeGroup = Tabs.Garrison:AddRightGroupbox('Range Indicator')
+RangeGroup:AddToggle('RangeIndicatorEnabled', {
+    Text = 'Enable Range Indicator', Default = false
+})
+RangeGroup:AddDropdown('RangeIgnoreTargets', {
+    Values = { 'Self', 'Own Team' },
+    Default = { 'Self', 'Own Team' },   -- default: enemies only (matches old behavior)
+    Multi = true,
+    Text = 'Ignore Target',
+    Tooltip = 'Hide rings on your own team and/or allies'
+})
+
+RangeGroup:AddDivider()
+RangeGroup:AddToggle('RangeCat_Soldiers', { Text = 'Soldiers', Default = true })
+RangeGroup:AddToggle('RangeCat_Tanks',    { Text = 'Tanks',    Default = true })
+RangeGroup:AddToggle('RangeCat_Planes',   { Text = 'Planes',   Default = true })
+RangeGroup:AddToggle('RangeCat_Space',    { Text = 'Space',    Default = true })
+RangeGroup:AddToggle('RangeCat_Naval',    { Text = 'Naval',    Default = true })
+RangeGroup:AddToggle('RangeCat_Defense',  { Text = 'Defense',  Default = true })
+
+
+RangeGroup:AddDivider()
+
+RangeGroup:AddToggle('RangeDistanceCheck', { Text = 'Distance Check', Default = false })
+RangeGroup:AddSlider('RangeMaxDistance',
+    { Text = 'Max Distance', Default = 250, Min = 0, Max = 500, Rounding = 0, Compact = false })
+RangeGroup:AddToggle('RangeDisableNearby', { Text = 'Disable When Nearby', Default = false })
+RangeGroup:AddSlider('RangeNearbyDistance',
+    { Text = 'Nearby Distance', Default = 25, Min = 0, Max = 100, Rounding = 0, Compact = false })
+
+RangeGroup:AddDivider()
+
+RangeGroup:AddDropdown('RangeColorMode', {
+    Values = { 'Default', 'Team Colors', 'Custom', 'RGB' },
+    Default = 'Default',
+    Multi = false,
+    Text = 'Color Mode'
+})
+
+local RangeOuterLabel = RangeGroup:AddLabel('Outer Ring Color')
+RangeOuterLabel:AddColorPicker('RangeOuterColor', {
+    Default = Color3.fromRGB(255, 60, 60),
+    Title = 'Outer Ring Color'
+})
+
+local RangeInnerLabel = RangeGroup:AddLabel('Inner Ring Color')
+RangeInnerLabel:AddColorPicker('RangeInnerColor', {
+    Default = Color3.fromRGB(255, 60, 60),
+    Title = 'Inner Ring Color'
+})
+
+-- Pickers stay visible at all times. The mode dropdown only affects how the
+-- colours are applied, not whether the rows are displayed. This used to try
+-- to hide/show them based on mode, but Linoria's label wrapper doesn't
+-- expose the row frame in a way we can reliably hide, and hiding it kept
+-- taking the whole groupbox with it.
+function RangeIndicator.setPickerVisible(_) end
+
+
+
+RangeGroup:AddDivider()
+local RangeStatusLabel = RangeGroup:AddLabel('Hover a friendly unit once to arm.')
+
+-- ============================================================
+-- RGB TAB (consolidated) - speed/smoothness shared by all RGB sources
+-- ============================================================
+local RGBGroup = Tabs.RGB:AddLeftGroupbox('RGB Customizer')
+RGBGroup:AddSlider('RGBSpeed',
+    { Text = 'RGB Speed', Default = 1, Min = 0.1, Max = 5, Rounding = 1, Compact = false })
+RGBGroup:AddSlider('RGBSmoothness',
+    { Text = 'RGB Smoothness', Default = 0.01, Min = 0.005, Max = 0.1, Rounding = 3, Compact = false })
+
+-- ============================================================
+-- UI SETTINGS TAB
+-- ============================================================
+local MenuGroup = Tabs['UI Settings']:AddLeftGroupbox('Menu')
+MenuGroup:AddButton('Unload', function() Library:Unload() end)
+MenuGroup:AddLabel('Menu bind'):AddKeyPicker('MenuKeybind',
+    { Default = 'End', NoUI = false, Text = 'Menu keybind' })
+Library.ToggleKeybind = Options.MenuKeybind
+
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({ 'MenuKeybind' })
+ThemeManager:SetFolder('CQ3UI/themes')
+SaveManager:SetFolder('CQ3UI')
+SaveManager:BuildConfigSection(Tabs['UI Settings'])
+ThemeManager:ApplyToTab(Tabs['UI Settings'])
+
+-- ============================================================
+-- HOOK TOGGLES -> Refresh dirty garrison displays
+-- ============================================================
+local ActiveDisplays = {}
+local DirtyBuildings = {}
+function MarkBuildingDirty(b) if ActiveDisplays[b] then DirtyBuildings[b] = true end end
+
+local function markAllDirty()
+    for b in pairs(ActiveDisplays) do DirtyBuildings[b] = true end
+    if UpdateAllDisplays then UpdateAllDisplays() end
+end
+
+Toggles.GarrisonViewEnabled:OnChanged(function(v) GARRISON_VIEW_ENABLED = v; markAllDirty() end)
+Toggles.GarrisonTeamColors:OnChanged(function(v) GARRISON_TEAM_COLORS = v; markAllDirty() end)
+
+Toggles.RangeIndicatorEnabled:OnChanged(function(v)
+    RangeIndicator.enabled = v
+    if v then
+        if not RangeIndicator.storedTemplate then
+            Notifier.send("Range Indicator",
+                "Hover any friendly unit once to capture the ring template.",
+                nil, 6)
+        else
+            RangeIndicator.rescan()
+        end
+    else
+        RangeIndicator.clearAll()
+    end
+end)
+
+Options.RangeIgnoreTargets:OnChanged(function(sel)
+    RangeIndicator.ignoreSelf = sel['Self'] == true
+    RangeIndicator.ignoreTeam = sel['Own Team'] == true
+    if RangeIndicator.enabled then RangeIndicator.rescan() end
+end)
+
+
+local function hookRangeCategory(toggleId, catKey)
+    Toggles[toggleId]:OnChanged(function(v)
+        RangeIndicator.categories[catKey] = v
+        if RangeIndicator.enabled then RangeIndicator.rescan() end
+    end)
+end
+
+hookRangeCategory('RangeCat_Soldiers', 'Soldiers')
+hookRangeCategory('RangeCat_Tanks',    'Tanks')
+hookRangeCategory('RangeCat_Planes',   'Planes')
+hookRangeCategory('RangeCat_Space',    'Space')
+hookRangeCategory('RangeCat_Naval',    'Naval')
+hookRangeCategory('RangeCat_Defense',  'Defense')
+
+
+Toggles.RangeDistanceCheck:OnChanged(function(v) RangeIndicator.distanceCheck = v end)
+Options.RangeMaxDistance:OnChanged(function(v) RangeIndicator.maxDistance = v end)
+Toggles.RangeDisableNearby:OnChanged(function(v) RangeIndicator.disableNearby = v end)
+Options.RangeNearbyDistance:OnChanged(function(v) RangeIndicator.nearbyDistance = v end)
+
+
+Options.RangeColorMode:OnChanged(function(v)
+    RangeIndicator.setPickerVisible(v == 'Custom')
+    if RangeIndicator.enabled then RangeIndicator.rescan() end
+end)
+
+Options.RangeOuterColor:OnChanged(function()
+    if RangeIndicator.enabled and Options.RangeColorMode.Value == 'Custom' then
+        RangeIndicator.rescan()
+    end
+end)
+
+Options.RangeInnerColor:OnChanged(function()
+    if RangeIndicator.enabled and Options.RangeColorMode.Value == 'Custom' then
+        RangeIndicator.rescan()
+    end
+end)
+
+
+Options.IgnoreTargets:OnChanged(function(sel)
+    IGNORE_SELF = sel['Self'] == true
+    IGNORE_TEAM = sel['Own Team'] == true
+    markAllDirty()
+end)
+Options.GarrisonMode:OnChanged(function(v) GARRISON_MODE = v; markAllDirty() end)
+local function refreshDisplays()
+    if UpdateAllDisplays then UpdateAllDisplays() end
+end
+
+
+Toggles.DistanceCheckEnabled:OnChanged(function(v) DISTANCE_CHECK_ENABLED = v; refreshDisplays() end)
+Options.MaxDistance:OnChanged(function(v) MAX_DISTANCE = v; refreshDisplays() end)
+Toggles.DisableNearby:OnChanged(function(v) DISABLE_NEARBY = v; refreshDisplays() end)
+Options.NearbyDistance:OnChanged(function(v) NEARBY_DISTANCE = v; refreshDisplays() end)
+Options.GarrisonHeight:OnChanged(function(v) CURRENT_HEIGHT_OFFSET = v; refreshDisplays() end)
+Options.GarrisonScale:OnChanged(function(v)
+    CURRENT_SCALE = v
+    for _, display in pairs(ActiveDisplays) do
+        if display.uiScale then display.uiScale.Scale = v end
+        if display.part then
+            display.part.Size = Vector3.new(
+                (1000 / 400) * v, ((display.requiredHeight or 100) / 400) * v, 1)
+        end
+        if display.gui then
+            display.gui.CanvasSize = Vector2.new(1000 * v, (display.requiredHeight or 100) * v)
+        end
+    end
+end)
+Options.ProductionMode:OnChanged(function() markAllDirty() end)
+Options.ProductionPosition:OnChanged(function(val)
+    for b, d in pairs(ActiveDisplays) do
+        if d.garrisonFrame and d.productionFrame then
+            if val == 'Above Garrison' then
+                d.productionFrame.LayoutOrder = 1; d.garrisonFrame.LayoutOrder = 2
+            else
+                d.garrisonFrame.LayoutOrder = 1; d.productionFrame.LayoutOrder = 2
+            end
+        end
+        markAllDirty()
+    end
+end)
+Toggles.ProductionViewEnabled:OnChanged(function(val)
+    if val then
+        markAllDirty()
+    else
+        for _, d in pairs(ActiveDisplays) do
+            if d.productionFrame then d.productionFrame:ClearAllChildren() end
+            if d.productionConnections then
+                for _, c in ipairs(d.productionConnections) do c:Disconnect() end
+                d.productionConnections = {}
+            end
+            d.activeProduction = nil
+            if d.separator then d.separator.Visible = false end
+            task.defer(function() if d.part then UpdateDisplaySize(d) end end)
+        end
+    end
+end)
+
+-- ============================================================
+-- GARRISON SYSTEM
+-- ============================================================
+-- State lives in globals (assigned by the OnChanged handlers above).
+-- Do NOT re-declare these with `local` — that would shadow the globals
+-- for every function defined below and break the UI wiring.
+GARRISON_MODE         = GARRISON_MODE         or "Detailed"
+GARRISON_VIEW_ENABLED = GARRISON_VIEW_ENABLED or true
+GARRISON_TEAM_COLORS  = GARRISON_TEAM_COLORS  or false
+IGNORE_SELF           = IGNORE_SELF           or false
+IGNORE_TEAM           = IGNORE_TEAM           or false
+DISTANCE_CHECK_ENABLED= DISTANCE_CHECK_ENABLED or false
+MAX_DISTANCE          = MAX_DISTANCE           or 250
+DISABLE_NEARBY        = DISABLE_NEARBY         or false
+NEARBY_DISTANCE       = NEARBY_DISTANCE        or 25
+CURRENT_HEIGHT_OFFSET = CURRENT_HEIGHT_OFFSET  or 0
+
+local BASE_HP_BAR_WIDTH   = 480
+local BASE_HP_BAR_HEIGHT  = 32
+local BASE_ROW_HEIGHT     = 80
+local BASE_PADDING        = 8
+local BASE_TEXT_SIZE      = 75
+local BASE_CONTAINER_WIDTH= 800
+local PROGRESS_BAR_WIDTH  = 400
+local PROGRESS_BAR_HEIGHT = 24
+
+local PIXELS_PER_STUD = 400
+local CANVAS_WIDTH    = 1000
+local CANVAS_HEIGHT   = 2000
+local PART_SIZE       = Vector3.new(CANVAS_WIDTH / PIXELS_PER_STUD,
+                                    CANVAS_HEIGHT / PIXELS_PER_STUD, 1)
+
+local Garrisonable = {
+    ["Bunker"] = true, ["Headquarters"] = true, ["Command Center"] = true,
+    ["Fort"] = true, ["Medi-Truck"] = true, ["Aircraft Carrier"] = true,
+    ["Transport Ship"] = true, ["Transport Plane"] = true,
+    ["Mothership"] = true, ["Helicopter"] = true
+}
+
+local function CalculateRequiredHeight(gc, pc)
+    local mode = GARRISON_MODE or "Detailed"
+    local prodMode = Options.ProductionMode and Options.ProductionMode.Value or "Detailed"
+    local gH = (mode == "Simple") and (BASE_ROW_HEIGHT * 0.6) or BASE_ROW_HEIGHT
+    local pH = BASE_ROW_HEIGHT * 0.7
+    local h = 0
+    if gc > 0 then h = h + gc * gH + (gc - 1) * BASE_PADDING end
+    if pc > 0 then
+        h = h + pc * pH + (pc - 1) * BASE_PADDING + PROGRESS_BAR_HEIGHT + 8
+    end
+    h = h + 20
+    return math.max(h, 100)
+end
+
+local HealthConnections = {}
 
 local function MakeHealthBar(parent, current, max)
-	local bar = Instance.new("Frame")
-	bar.Size = UDim2.new(0, BASE_HP_BAR_WIDTH, 0, BASE_HP_BAR_HEIGHT)
-	bar.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-	bar.BorderColor3 = Color3.new(0, 0, 0)
-	bar.BorderSizePixel = 2
-	bar.Parent = parent
-
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(0, BASE_HP_BAR_WIDTH, 0, BASE_HP_BAR_HEIGHT)
+    bar.BackgroundColor3 = Color3.fromRGB(40,40,40)
+    bar.BorderColor3 = Color3.new(0,0,0)
+    bar.BorderSizePixel = 2
+    bar.Parent = parent
     local fill = Instance.new("Frame")
     fill.Name = "Fill"
     fill.Size = UDim2.new(max > 0 and current/max or 0, 0, 1, 0)
-    fill.BackgroundColor3 = Color3.fromRGB(0, 255, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(0,255,0)
     fill.BorderSizePixel = 0
     fill.Parent = bar
-
     return bar, fill
 end
-
 
 local function HookBuildingMovement(display)
     local torso = display.torso
     if not torso then return end
-
     if display.movementConnection then
-        display.movementConnection:Disconnect()
-        display.movementConnection = nil
+        display.movementConnection:Disconnect(); display.movementConnection = nil
     end
-
     display.movementConnection = torso:GetPropertyChangedSignal("CFrame"):Connect(function()
-        UpdateAllDisplays()
+        -- just mark for repositioning on next tick
+        display._needsReposition = true
     end)
 end
 
@@ -702,7 +1216,7 @@ local function CreateDisplay(building, teamFolder)
 
     local part = Instance.new("Part")
     part.Size = PART_SIZE * CURRENT_SCALE
-    part.Transparency = 1   -- OLD (part.Transparency = 0.5)
+    part.Transparency = 1
     part.CanCollide = false
     part.CanQuery = false
     part.Anchored = true
@@ -713,18 +1227,13 @@ local function CreateDisplay(building, teamFolder)
     gui.AlwaysOnTop = true
     gui.LightInfluence = 0
     gui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
-    gui.CanvasSize = Vector2.new(CANVAS_WIDTH * CURRENT_SCALE, 100 * CURRENT_SCALE) -- initial small
+    gui.CanvasSize = Vector2.new(CANVAS_WIDTH * CURRENT_SCALE, 100 * CURRENT_SCALE)
     gui.Parent = part
-
-    -- Store base sizes for scaling
-    local basePartSize = PART_SIZE
-    local baseCanvasSize = Vector2.new(CANVAS_WIDTH, CANVAS_HEIGHT)
 
     local uiScale = Instance.new("UIScale")
     uiScale.Scale = CURRENT_SCALE
     uiScale.Parent = gui
 
-    -- Main container anchored top-center, grows downward
     local mainContainer = Instance.new("Frame")
     mainContainer.Name = "MainContainer"
     mainContainer.AnchorPoint = Vector2.new(0.5, 0)
@@ -742,7 +1251,6 @@ local function CreateDisplay(building, teamFolder)
     mainLayout.SortOrder = Enum.SortOrder.LayoutOrder
     mainLayout.Parent = mainContainer
 
-    -- Garrison frame
     local garrisonFrame = Instance.new("Frame")
     garrisonFrame.Name = "GarrisonFrame"
     garrisonFrame.Size = UDim2.new(1, 0, 0, 0)
@@ -751,14 +1259,23 @@ local function CreateDisplay(building, teamFolder)
     garrisonFrame.LayoutOrder = 1
     garrisonFrame.Parent = mainContainer
 
-    local garrisonLayout = Instance.new("UIListLayout")
-    garrisonLayout.FillDirection = Enum.FillDirection.Vertical
-    garrisonLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    garrisonLayout.VerticalAlignment = Enum.VerticalAlignment.Top
-    garrisonLayout.Padding = UDim.new(0, BASE_PADDING)
-    garrisonLayout.Parent = garrisonFrame
+    local gl = Instance.new("UIListLayout")
+    gl.FillDirection = Enum.FillDirection.Vertical
+    gl.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    gl.VerticalAlignment = Enum.VerticalAlignment.Top
+    gl.Padding = UDim.new(0, BASE_PADDING)
+    gl.Parent = garrisonFrame
 
-    -- Production frame
+    local separator = Instance.new("Frame")
+    separator.Name = "Separator"
+    separator.Size = UDim2.new(1, 0, 0, 2)
+    separator.BackgroundColor3 = Color3.new(1,1,1)
+    separator.BackgroundTransparency = 0.2
+    separator.BorderSizePixel = 0
+    separator.LayoutOrder = 1.5
+    separator.Visible = false
+    separator.Parent = mainContainer
+
     local productionFrame = Instance.new("Frame")
     productionFrame.Name = "ProductionFrame"
     productionFrame.Size = UDim2.new(1, 0, 0, 0)
@@ -766,109 +1283,56 @@ local function CreateDisplay(building, teamFolder)
     productionFrame.BackgroundTransparency = 1
     productionFrame.LayoutOrder = 2
     productionFrame.Parent = mainContainer
-	
-	    -- Separator (hidden by default)
-    local separator = Instance.new("Frame")
-    separator.Name = "Separator"
-    separator.Size = UDim2.new(1, 0, 0, 2)
-    separator.BackgroundColor3 = Color3.new(1, 1, 1)
-    separator.BackgroundTransparency = 0.2
-    separator.BorderSizePixel = 0
-    separator.LayoutOrder = 1.5  -- between garrison (1) and production (2)
-    separator.Visible = false
-    separator.Parent = mainContainer
-	
-	
-	
-	
 
-    local productionLayout = Instance.new("UIListLayout")
-    productionLayout.FillDirection = Enum.FillDirection.Vertical
-    productionLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    productionLayout.VerticalAlignment = Enum.VerticalAlignment.Top
-    productionLayout.Padding = UDim.new(0, BASE_PADDING)
-    productionLayout.Parent = productionFrame
-
-    local ownerVal = building:FindFirstChild("Owner")
+    local pl = Instance.new("UIListLayout")
+    pl.FillDirection = Enum.FillDirection.Vertical
+    pl.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    pl.VerticalAlignment = Enum.VerticalAlignment.Top
+    pl.Padding = UDim.new(0, BASE_PADDING)
+    pl.Parent = productionFrame
 
     ActiveDisplays[building] = {
-        part = part,
-        gui = gui,
-        mainContainer = mainContainer,
-        garrisonFrame = garrisonFrame,
-        productionFrame = productionFrame,
-        uiScale = uiScale,
-        torso = torso,
+        part = part, gui = gui, mainContainer = mainContainer,
+        garrisonFrame = garrisonFrame, productionFrame = productionFrame,
+        uiScale = uiScale, torso = torso,
         folder = torso:FindFirstChild("Garrisoned"),
         productionFolder = torso:FindFirstChild("Producing"),
         teamFolder = teamFolder,
-        owner = ownerVal,
-        productionConnections = {},
-        queueOrder = {},
-        activeProduction = nil,
-		separator = separator,
-        basePartSize = PART_SIZE,
-        baseCanvasSize = Vector2.new(CANVAS_WIDTH, 100),
-        requiredHeight = 100
+        owner = building:FindFirstChild("Owner"),
+        productionConnections = {}, hookConnections = {},
+        queueOrder = {}, requiredHeight = 100,
+        separator = separator,
     }
-
-    -- Hook torso movement so the UI follows the building when it moves
     HookBuildingMovement(ActiveDisplays[building])
-
-    -- defer actual UI build to the throttled loop
     MarkBuildingDirty(building)
 
-    -- Cleanup when the building is removed
     building.AncestryChanged:Connect(function(_, parent)
         if not parent then
-            local display = ActiveDisplays[building]
-            if display then
-                -- Disconnect production UI connections
-                for _, conn in ipairs(display.productionConnections or {}) do
-                    conn:Disconnect()
-                end
-                -- Disconnect hook connections (garrison + production folder hooks)
-                for _, conn in ipairs(display.hookConnections or {}) do
-                    conn:Disconnect()
-                end
-                -- Disconnect health connections
+            local d = ActiveDisplays[building]
+            if d then
+                for _, c in ipairs(d.productionConnections or {}) do c:Disconnect() end
+                for _, c in ipairs(d.hookConnections or {}) do c:Disconnect() end
                 if HealthConnections[building] then
-                    for _, conn in ipairs(HealthConnections[building]) do
-                        conn:Disconnect()
-                    end
+                    for _, c in ipairs(HealthConnections[building]) do c:Disconnect() end
                     HealthConnections[building] = nil
                 end
-                -- Disconnect movement connection
-                if display.movementConnection then
-                    display.movementConnection:Disconnect()
-                    display.movementConnection = nil
-                end
-                if display.part then
-                    display.part:Destroy()
-                end
+                if d.movementConnection then d.movementConnection:Disconnect() end
+                if d.part then d.part:Destroy() end
                 ActiveDisplays[building] = nil
             end
         end
     end)
 end
 
----------------------------------------------------------------
--- UPDATE GARRISON DISPLAY (without scaling)
----------------------------------------------------------------
 function UpdateGarrisonDisplay(building, units)
     local display = ActiveDisplays[building]
     if not display then return end
-
     HealthConnections[building] = HealthConnections[building] or {}
-    for _, conn in ipairs(HealthConnections[building]) do
-        conn:Disconnect()
-    end
+    for _, c in ipairs(HealthConnections[building]) do c:Disconnect() end
     HealthConnections[building] = {}
-
     local frame = display.garrisonFrame
     frame:ClearAllChildren()
 
-    -- Add layout to stack rows vertically
     local layout = Instance.new("UIListLayout")
     layout.FillDirection = Enum.FillDirection.Vertical
     layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
@@ -876,55 +1340,42 @@ function UpdateGarrisonDisplay(building, units)
     layout.Padding = UDim.new(0, BASE_PADDING)
     layout.Parent = frame
 
-    -- SIMPLE MODE
     if GARRISON_MODE == "Simple" then
         local grouped = {}
         for _, unit in ipairs(units) do
-            local name = unit.Name
-            if name == "Construction Soldier" then
-                name = "⚠ Construction Soldier ⚠"
-            end
-            grouped[name] = (grouped[name] or 0) + 1
+            local n = unit.Name
+            if n == "Construction Soldier" then n = "⚠ Construction Soldier ⚠" end
+            grouped[n] = (grouped[n] or 0) + 1
         end
-
         local sorted = {}
-        for name, count in pairs(grouped) do
-            table.insert(sorted, { name = name, count = count })
-        end
+        for n, c in pairs(grouped) do table.insert(sorted, { name = n, count = c }) end
         table.sort(sorted, function(a, b) return a.name:lower() < b.name:lower() end)
-
         for _, entry in ipairs(sorted) do
             local row = Instance.new("Frame")
             row.Size = UDim2.new(1, 0, 0, BASE_ROW_HEIGHT * 0.6)
             row.BackgroundTransparency = 1
             row.Parent = frame
-
-            local label = Instance.new("TextLabel")
-            label.Size = UDim2.new(1, 0, 1, 0)
-            label.BackgroundTransparency = 1
-            if GARRISON_TEAM_COLORS then
-                label.TextColor3 = GetTeamColorForFolder(display.teamFolder)
-            else
-                label.TextColor3 = Color3.new(1,1,1)
-            end
-            label.TextStrokeColor3 = Color3.new(0, 0, 0)
-            label.TextStrokeTransparency = 0
-            label.Font = Enum.Font.SourceSansBold
-            label.TextSize = BASE_TEXT_SIZE
-            label.TextXAlignment = Enum.TextXAlignment.Center
-            label.Text = (entry.count > 1) and string.format("• %s (x%d)", entry.name, entry.count) or "• " .. entry.name
-            label.Parent = row
+            local lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.new(1, 0, 1, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.TextColor3 = GARRISON_TEAM_COLORS and TeamData.getColor(display.teamFolder) or Color3.new(1,1,1)
+            lbl.TextStrokeColor3 = Color3.new(0,0,0)
+            lbl.TextStrokeTransparency = 0
+            lbl.Font = Enum.Font.SourceSansBold
+            lbl.TextSize = BASE_TEXT_SIZE
+            lbl.TextXAlignment = Enum.TextXAlignment.Center
+            lbl.Text = (entry.count > 1) and string.format("• %s (x%d)", entry.name, entry.count)
+                                              or "• " .. entry.name
+            lbl.Parent = row
         end
         return
     end
 
-    -- DETAILED MODE
     table.sort(units, function(a, b)
-        local nameA = a.Name
-        local nameB = b.Name
-        if nameA == "Construction Soldier" then nameA = "⚠ Construction Soldier ⚠" end
-        if nameB == "Construction Soldier" then nameB = "⚠ Construction Soldier ⚠" end
-        return nameA:lower() < nameB:lower()
+        local na, nb = a.Name, b.Name
+        if na == "Construction Soldier" then na = "⚠ Construction Soldier ⚠" end
+        if nb == "Construction Soldier" then nb = "⚠ Construction Soldier ⚠" end
+        return na:lower() < nb:lower()
     end)
 
     for _, unit in ipairs(units) do
@@ -933,9 +1384,6 @@ function UpdateGarrisonDisplay(building, units)
         row.BackgroundTransparency = 1
         row.Parent = frame
 
-        local hp = unit:FindFirstChild("Health")
-        local maxhp = unit:FindFirstChild("MaxHealth")
-
         local hLayout = Instance.new("UIListLayout")
         hLayout.FillDirection = Enum.FillDirection.Horizontal
         hLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
@@ -943,50 +1391,39 @@ function UpdateGarrisonDisplay(building, units)
         hLayout.Padding = UDim.new(0, BASE_PADDING)
         hLayout.Parent = row
 
-        if hp and maxhp and hp:IsA("NumberValue") and maxhp:IsA("NumberValue") then
-            local bar, fill = MakeHealthBar(row, hp.Value, maxhp.Value)
+        local hp = unit:FindFirstChild("Health")
+        local mhp = unit:FindFirstChild("MaxHealth")
+        if hp and mhp and hp:IsA("NumberValue") and mhp:IsA("NumberValue") then
+            local _, fill = MakeHealthBar(row, hp.Value, mhp.Value)
             local conn = hp:GetPropertyChangedSignal("Value"):Connect(function()
-                if maxhp and maxhp.Value > 0 then
-                    fill.Size = UDim2.new(math.clamp(hp.Value / maxhp.Value, 0, 1), 0, 1, 0)
-                else
-                    fill.Size = UDim2.new(0, 0, 1, 0)
-                end
+                fill.Size = UDim2.new(mhp.Value > 0 and math.clamp(hp.Value / mhp.Value, 0, 1) or 0, 0, 1, 0)
             end)
             table.insert(HealthConnections[building], conn)
         end
 
-        local name = unit.Name
-        if name == "Construction Soldier" then name = "⚠ Construction Soldier ⚠" end
-
-        local label = Instance.new("TextLabel")
-        label.Size = UDim2.new(0, 450, 1, 0)
-        label.BackgroundTransparency = 1
-        label.TextColor3 = GARRISON_TEAM_COLORS and GetTeamColorForFolder(display.teamFolder) or Color3.new(1,1,1)
-        label.TextStrokeColor3 = Color3.new(0, 0, 0)
-        label.TextStrokeTransparency = 0
-        label.Font = Enum.Font.SourceSansBold
-        label.TextSize = BASE_TEXT_SIZE
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.Text = "• " .. name
-        label.Parent = row
+        local n = unit.Name
+        if n == "Construction Soldier" then n = "⚠ Construction Soldier ⚠" end
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(0, 450, 1, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.TextColor3 = GARRISON_TEAM_COLORS and TeamData.getColor(display.teamFolder) or Color3.new(1,1,1)
+        lbl.TextStrokeColor3 = Color3.new(0,0,0)
+        lbl.TextStrokeTransparency = 0
+        lbl.Font = Enum.Font.SourceSansBold
+        lbl.TextSize = BASE_TEXT_SIZE
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Text = "• " .. n
+        lbl.Parent = row
     end
 end
 
----------------------------------------------------------------
--- UPDATE PRODUCTION DISPLAY
----------------------------------------------------------------
 local function BuildProductionRows(display)
     local frame = display.productionFrame
     frame:ClearAllChildren()
-
-    -- Disconnect old production UI connections
-    for _, conn in ipairs(display.productionConnections) do
-        conn:Disconnect()
-    end
+    for _, c in ipairs(display.productionConnections) do c:Disconnect() end
     display.productionConnections = {}
     display.activeProduction = nil
 
-    -- Add layout to stack rows vertically
     local layout = Instance.new("UIListLayout")
     layout.FillDirection = Enum.FillDirection.Vertical
     layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
@@ -996,60 +1433,41 @@ local function BuildProductionRows(display)
 
     local queue = display.queueOrder
     if #queue == 0 then return end
-
     local mode = Options.ProductionMode and Options.ProductionMode.Value or 'Detailed'
 
-    -- Find active item (first with Progress > 0 and < 1)
     local activeItem = nil
     for _, item in ipairs(queue) do
-        local prog = item:FindFirstChild("Progress")
-        if prog and prog:IsA("NumberValue") and prog.Value > 0 and prog.Value < 1 then
-            activeItem = item
-            break
+        local p = item:FindFirstChild("Progress")
+        if p and p:IsA("NumberValue") and p.Value > 0 and p.Value < 1 then
+            activeItem = item; break
         end
     end
-    if not activeItem and #queue > 0 then
-        activeItem = queue[1]
-    end
+    if not activeItem and #queue > 0 then activeItem = queue[1] end
 
-    -- Build rows depending on mode
     if mode == 'Simple' then
-        local typeOrder = {}
+        local order, seen = {}, {}
         for _, item in ipairs(queue) do
-            local itemName = item.Name
-            if not typeOrder[itemName] then
-                table.insert(typeOrder, itemName)
-                typeOrder[itemName] = true
-            end
+            if not seen[item.Name] then table.insert(order, item.Name); seen[item.Name] = true end
         end
-
-        for i = #typeOrder, 1, -1 do
-            local typeName = typeOrder[i]
+        for i = #order, 1, -1 do
+            local name = order[i]
             local count = 0
-            for _, qItem in ipairs(queue) do
-                if qItem.Name == typeName then count = count + 1 end
-            end
-
+            for _, q in ipairs(queue) do if q.Name == name then count = count + 1 end end
             local row = Instance.new("Frame")
             row.Size = UDim2.new(1, 0, 0, BASE_ROW_HEIGHT * 0.7)
             row.BackgroundTransparency = 1
             row.Parent = frame
-
-            local label = Instance.new("TextLabel")
-            label.Size = UDim2.new(1, 0, 1, 0)
-            label.BackgroundTransparency = 1
-            if GARRISON_TEAM_COLORS then
-                label.TextColor3 = GetTeamColorForFolder(display.teamFolder)
-            else
-                label.TextColor3 = Color3.new(1,1,1)
-            end
-            label.TextStrokeColor3 = Color3.new(0, 0, 0)
-            label.TextStrokeTransparency = 0
-            label.Font = Enum.Font.SourceSansBold
-            label.TextSize = BASE_TEXT_SIZE
-            label.TextXAlignment = Enum.TextXAlignment.Center
-            label.Text = (count > 1) and string.format("(x%d) %s", count, typeName) or typeName
-            label.Parent = row
+            local lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.new(1, 0, 1, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.TextColor3 = GARRISON_TEAM_COLORS and TeamData.getColor(display.teamFolder) or Color3.new(1,1,1)
+            lbl.TextStrokeColor3 = Color3.new(0,0,0)
+            lbl.TextStrokeTransparency = 0
+            lbl.Font = Enum.Font.SourceSansBold
+            lbl.TextSize = BASE_TEXT_SIZE
+            lbl.TextXAlignment = Enum.TextXAlignment.Center
+            lbl.Text = (count > 1) and string.format("(x%d) %s", count, name) or name
+            lbl.Parent = row
         end
     else
         for i = #queue, 1, -1 do
@@ -1058,30 +1476,23 @@ local function BuildProductionRows(display)
             row.Size = UDim2.new(1, 0, 0, BASE_ROW_HEIGHT * 0.7)
             row.BackgroundTransparency = 1
             row.Parent = frame
-
-            local label = Instance.new("TextLabel")
-            label.Size = UDim2.new(1, 0, 1, 0)
-            label.BackgroundTransparency = 1
-            if GARRISON_TEAM_COLORS then
-                label.TextColor3 = GetTeamColorForFolder(display.teamFolder)
-            else
-                label.TextColor3 = Color3.new(1,1,1)
-            end
-            label.TextStrokeColor3 = Color3.new(0, 0, 0)
-            label.TextStrokeTransparency = 0
-            label.Font = Enum.Font.SourceSansBold
-            label.TextSize = BASE_TEXT_SIZE
-            label.TextXAlignment = Enum.TextXAlignment.Center
-            label.Text = item.Name
-            label.Parent = row
+            local lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.new(1, 0, 1, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.TextColor3 = GARRISON_TEAM_COLORS and TeamData.getColor(display.teamFolder) or Color3.new(1,1,1)
+            lbl.TextStrokeColor3 = Color3.new(0,0,0)
+            lbl.TextStrokeTransparency = 0
+            lbl.Font = Enum.Font.SourceSansBold
+            lbl.TextSize = BASE_TEXT_SIZE
+            lbl.TextXAlignment = Enum.TextXAlignment.Center
+            lbl.Text = item.Name
+            lbl.Parent = row
         end
     end
 
-    -- Progress bar for active item (below bottom row)
     if activeItem then
         local prog = activeItem:FindFirstChild("Progress")
         local pct = prog and prog.Value or 0
-
         local bar = Instance.new("Frame")
         bar.Size = UDim2.new(0, PROGRESS_BAR_WIDTH, 0, PROGRESS_BAR_HEIGHT)
         bar.AnchorPoint = Vector2.new(0.5, 0)
@@ -1090,35 +1501,25 @@ local function BuildProductionRows(display)
         bar.BorderColor3 = Color3.new(0,0,0)
         bar.BorderSizePixel = 2
         bar.Parent = frame
-
         local fill = Instance.new("Frame")
         fill.Size = UDim2.new(math.clamp(pct,0,1), 0, 1, 0)
         fill.BackgroundColor3 = Color3.fromRGB(0,255,0)
         fill.BorderSizePixel = 0
         fill.Parent = bar
-
-        local remaining = Instance.new("Frame")
-        remaining.Size = UDim2.new(1 - math.clamp(pct,0,1), 0, 1, 0)
-        remaining.Position = UDim2.new(math.clamp(pct,0,1), 0, 0, 0)
-        remaining.BackgroundColor3 = Color3.fromRGB(255,0,0)
-        remaining.BorderSizePixel = 0
-        remaining.Parent = bar
-
-        display.activeProduction = {
-            item = activeItem,
-            fill = fill,
-            remaining = remaining,
-            bar = bar
-        }
-
-        local progressVal = prog
-        if progressVal and progressVal:IsA("NumberValue") then
-            local conn = progressVal:GetPropertyChangedSignal("Value"):Connect(function()
+        local rem = Instance.new("Frame")
+        rem.Size = UDim2.new(1 - math.clamp(pct,0,1), 0, 1, 0)
+        rem.Position = UDim2.new(math.clamp(pct,0,1), 0, 0, 0)
+        rem.BackgroundColor3 = Color3.fromRGB(255,0,0)
+        rem.BorderSizePixel = 0
+        rem.Parent = bar
+        display.activeProduction = { item = activeItem, fill = fill, remaining = rem, bar = bar }
+        if prog and prog:IsA("NumberValue") then
+            local conn = prog:GetPropertyChangedSignal("Value"):Connect(function()
                 if display.activeProduction and display.activeProduction.item == activeItem then
-                    local newPct = progressVal.Value
-                    display.activeProduction.fill.Size = UDim2.new(math.clamp(newPct,0,1), 0, 1, 0)
-                    display.activeProduction.remaining.Size = UDim2.new(1 - math.clamp(newPct,0,1), 0, 1, 0)
-                    display.activeProduction.remaining.Position = UDim2.new(math.clamp(newPct,0,1), 0, 0, 0)
+                    local p = prog.Value
+                    display.activeProduction.fill.Size = UDim2.new(math.clamp(p,0,1), 0, 1, 0)
+                    display.activeProduction.remaining.Size = UDim2.new(1 - math.clamp(p,0,1), 0, 1, 0)
+                    display.activeProduction.remaining.Position = UDim2.new(math.clamp(p,0,1), 0, 0, 0)
                 end
             end)
             table.insert(display.productionConnections, conn)
@@ -1126,512 +1527,245 @@ local function BuildProductionRows(display)
     end
 end
 
-
-local function UpdateDisplaySize(display)
-    local garrisonUnits = display.folder and display.folder:GetChildren() or {}
-    local productionUnits = display.productionFolder and display.productionFolder:GetChildren() or {}
-    local requiredHeight = CalculateRequiredHeight(#garrisonUnits, #productionUnits)
-    display.requiredHeight = requiredHeight
-    display.gui.CanvasSize = Vector2.new(CANVAS_WIDTH * CURRENT_SCALE, requiredHeight * CURRENT_SCALE)
+function UpdateDisplaySize(display)
+    local g = display.folder and display.folder:GetChildren() or {}
+    local p = display.productionFolder and display.productionFolder:GetChildren() or {}
+    local h = CalculateRequiredHeight(#g, #p)
+    display.requiredHeight = h
+    display.gui.CanvasSize = Vector2.new(CANVAS_WIDTH * CURRENT_SCALE, h * CURRENT_SCALE)
     display.part.Size = Vector3.new(
         (CANVAS_WIDTH / PIXELS_PER_STUD) * CURRENT_SCALE,
-        (requiredHeight / PIXELS_PER_STUD) * CURRENT_SCALE,
-        1
-    )
-
-    -- Show separator only if both garrison and production have content
-    local hasGarrison = #garrisonUnits > 0
-    local hasProduction = Toggles.ProductionViewEnabled.Value and #productionUnits > 0
+        (h / PIXELS_PER_STUD) * CURRENT_SCALE, 1)
     if display.separator then
-        display.separator.Visible = hasGarrison and hasProduction
+        display.separator.Visible = #g > 0 and Toggles.ProductionViewEnabled.Value and #p > 0
     end
 end
 
-
----------------------------------------------------------------
--- EVENT-BASED GARRISON VISIBILITY + POSITIONING (P3 MODE)
----------------------------------------------------------------
-
-local CAMERA_UPDATE_HZ = 120 -- ~12 updates per second
-local CAMERA_UPDATE_INTERVAL = 1 / CAMERA_UPDATE_HZ
-local lastCamUpdate = 0
-
-local lastCamCFrame = nil
-
--- Cache team info once per update
-local function GetTeamContext()
-    return GetMyTeamColor(), GetMyAlliedColors()
-end
-
--- Apply visibility + position to ONE building
 local function UpdateOneDisplay(display, camPos, myTeam, myAllies)
     local torso = display.torso
-    if not torso or not torso.Parent then
-        display.gui.Enabled = false
-        return
-    end
-
+    if not torso or not torso.Parent then display.gui.Enabled = false; return end
     local pos = torso.Position
     local dist = (camPos - pos).Magnitude
 
-    -- read live settings from UI
-    local distanceCheck   = Toggles.DistanceCheckEnabled.Value
-    local maxDist         = Options.MaxDistance.Value
-    local disableNearby   = Toggles.DisableNearby.Value
-    local nearbyDist      = Options.NearbyDistance.Value
-    local ignoreTable     = Options.IgnoreTargets.Value or {}
-    local ignoreSelf      = ignoreTable["Self"] == true
-    local ignoreTeam      = ignoreTable["Own Team"] == true
-    local heightOffset    = Options.GarrisonHeight.Value
+    if DISTANCE_CHECK_ENABLED and dist > MAX_DISTANCE then display.gui.Enabled = false; return end
+    if DISABLE_NEARBY and dist < NEARBY_DISTANCE then display.gui.Enabled = false; return end
 
-    -- DISTANCE CHECK
-    if distanceCheck and dist > maxDist then
-        display.gui.Enabled = false
-        return
-    end
-
-    -- NEARBY CHECK
-    if disableNearby and dist < nearbyDist then
-        display.gui.Enabled = false
-        return
-    end
-
-    -- IGNORE LOGIC
-    if ignoreSelf or ignoreTeam then
-        local buildingTeam = display.teamFolder and display.teamFolder.Name
-        local isOwner = (buildingTeam == myTeam)
-
+    if IGNORE_SELF or IGNORE_TEAM then
+        local bTeam = display.teamFolder and display.teamFolder.Name
+        local isOwner = (bTeam == myTeam)
         local sameTeam = isOwner
-        if not sameTeam and buildingTeam then
+        if not sameTeam and bTeam then
             for _, ally in ipairs(myAllies) do
-                if ally == buildingTeam then
-                    sameTeam = true
-                    break
-                end
+                if ally == bTeam then sameTeam = true; break end
             end
         end
-
-        if ignoreSelf and isOwner then
-            display.gui.Enabled = false
-            return
-        end
-
-        if ignoreTeam and sameTeam and not isOwner then
-            display.gui.Enabled = false
-            return
-        end
+        if IGNORE_SELF and isOwner then display.gui.Enabled = false; return end
+        if IGNORE_TEAM and sameTeam and not isOwner then display.gui.Enabled = false; return end
     end
 
-    -- PASSED ALL CHECKS → SHOW + POSITION (keep upright, only yaw)
-    -- PASSED ALL CHECKS → SHOW + POSITION (tilt with camera)
     display.gui.Enabled = true
     local partHeight = display.part.Size.Y
     display.part.CFrame = CFrame.new(
-        pos + Vector3.new(0, 4 + heightOffset - partHeight/2, 0),
-        camPos
-    )
+        pos + Vector3.new(0, 4 + CURRENT_HEIGHT_OFFSET - partHeight/2, 0),
+        camPos)
+end
+
+local lastReposition = 0
+
+
+
+function Hook(building, folder, teamFolder)
+    local d = ActiveDisplays[building]
+    if not d then return end
+    d.hookConnections = d.hookConnections or {}
+    local function Refresh() MarkBuildingDirty(building) end
+    Refresh()
+    table.insert(d.hookConnections, folder.ChildAdded:Connect(function() task.defer(Refresh) end))
+    table.insert(d.hookConnections, folder.ChildRemoved:Connect(function() task.defer(Refresh) end))
+end
+
+function HookProduction(building, prodFolder, teamFolder)
+    local d = ActiveDisplays[building]
+    if not d then return end
+    d.hookConnections = d.hookConnections or {}
+    d.queueOrder = {}
+    for _, c in ipairs(prodFolder:GetChildren()) do table.insert(d.queueOrder, c) end
+    table.sort(d.queueOrder, function(a,b) return a.Name < b.Name end)
+    local function Refresh() MarkBuildingDirty(building) end
+    table.insert(d.hookConnections, prodFolder.ChildAdded:Connect(function(c)
+        table.insert(d.queueOrder, c); task.defer(Refresh)
+    end))
+    table.insert(d.hookConnections, prodFolder.ChildRemoved:Connect(function(c)
+        for i, item in ipairs(d.queueOrder) do
+            if item == c then table.remove(d.queueOrder, i); break end
+        end
+        task.defer(Refresh)
+    end))
+    Refresh()
 end
 
 
--- Update ALL displays (throttled, heals skin‑swapped buildings)
-local function UpdateAllDisplays()
-		if not Toggles.GarrisonViewEnabled.Value then
-			for _, display in pairs(ActiveDisplays or {}) do
-				display.gui.Enabled = false
-			end
-			return
-		end
 
-    if next(ActiveDisplays) == nil then
+
+function UpdateAllDisplays()
+    if not GARRISON_VIEW_ENABLED then
+        for _, d in pairs(ActiveDisplays) do d.gui.Enabled = false end
         return
     end
-
+    if next(ActiveDisplays) == nil then return end
     local cam = workspace.CurrentCamera
     if not cam then return end
-
     local camPos = cam.CFrame.Position
-    local myTeam, myAllies = GetTeamContext()
-	
+    local myTeam = TeamData.getMyTeamColor()
+    local myAllies = TeamData.getMyAlliedColors()
 
-    -- Scan for any missing displayable buildings (garrison or production)
-    local myTeamFolder = TeamsFolder:FindFirstChild(myTeam)
+    -- Scan for new buildings on our team
+    local myTeamFolder = myTeam and TeamsFolder:FindFirstChild(myTeam)
     if myTeamFolder then
-        for _, building in ipairs(myTeamFolder:GetChildren()) do
-            if building:IsA("Model") and not ActiveDisplays[building] then
-                local torso = building:FindFirstChild("Torso")
+        for _, b in ipairs(myTeamFolder:GetChildren()) do
+            if b:IsA("Model") and not ActiveDisplays[b] then
+                local torso = b:FindFirstChild("Torso")
                 if torso then
-                    local gFolder = torso:FindFirstChild("Garrisoned")
-                    local pFolder = torso:FindFirstChild("Producing")
-                    if gFolder or pFolder then
-                        CreateDisplay(building, myTeamFolder)
-                        if gFolder then Hook(building, gFolder, myTeamFolder) end
-                        if pFolder then HookProduction(building, pFolder, myTeamFolder) end
+                    local g = torso:FindFirstChild("Garrisoned")
+                    local p = torso:FindFirstChild("Producing")
+                    if g or p then
+                        CreateDisplay(b, myTeamFolder)
+                        if g then Hook(b, g, myTeamFolder) end
+                        if p then HookProduction(b, p, myTeamFolder) end
                     end
                 end
             end
         end
     end
-	
-	
 
-    local deadBuildings = {}   -- set: building → true
-    local healed = false
-
-	for building, display in pairs(ActiveDisplays or {}) do
-		-- 1) Building itself is gone (AncestryChanged cleanup will handle this too)
-        if not building or not building.Parent then
-            deadBuildings[building] = true
+    local dead = {}
+    for b, d in pairs(ActiveDisplays) do
+        if not b or not b.Parent then
+            dead[b] = true
         else
-            -- === TORSO HEAL ===
-            local torso = display.torso
-            local torsoValid = torso and torso.Parent and torso:IsDescendantOf(building)
-            if not torsoValid then
-                local newTorso = building:FindFirstChild("Torso")
-                if newTorso and newTorso:IsA("BasePart") then
-                    display.torso = newTorso
-                    torso = newTorso
-                    HookBuildingMovement(display)
+            local torso = d.torso
+            if not (torso and torso.Parent and torso:IsDescendantOf(b)) then
+                local nt = b:FindFirstChild("Torso")
+                if nt and nt:IsA("BasePart") then
+                    d.torso = nt; torso = nt; HookBuildingMovement(d)
                 end
             end
-
-            -- === GARRISON FOLDER HEAL ===
-            -- Valid = exists AND is a descendant of the current torso
-            local folderValid = display.folder
-                and display.folder.Parent
-                and torso
-                and display.folder:IsDescendantOf(torso)
+            local folderValid = d.folder and d.folder.Parent and torso and d.folder:IsDescendantOf(torso)
             if not folderValid and torso then
-                local newGarrisoned = torso:FindFirstChild("Garrisoned")
-                if newGarrisoned then
-                    -- Disconnect old hooks tied to the previous folder
-                    for _, conn in ipairs(display.hookConnections or {}) do
-                        conn:Disconnect()
-                    end
-                    display.hookConnections = {}
-
-                    display.folder = newGarrisoned
-                    Hook(building, newGarrisoned, display.teamFolder)
-                    MarkBuildingDirty(building)
-                    healed = true
+                local ng = torso:FindFirstChild("Garrisoned")
+                if ng then
+                    for _, c in ipairs(d.hookConnections or {}) do c:Disconnect() end
+                    d.hookConnections = {}
+                    d.folder = ng
+                    Hook(b, ng, d.teamFolder)
+                    MarkBuildingDirty(b)
                 end
-                -- Do NOT mark as dead if newGarrisoned is nil.
-                -- The building may just be mid-rebuild. We'll retry next frame.
             end
-
-            -- === PRODUCTION FOLDER HEAL ===
-            local prodValid = display.productionFolder
-                and display.productionFolder.Parent
-                and torso
-                and display.productionFolder:IsDescendantOf(torso)
+            local prodValid = d.productionFolder and d.productionFolder.Parent and torso
+                and d.productionFolder:IsDescendantOf(torso)
             if not prodValid and torso then
-                local newProduction = torso:FindFirstChild("Producing")
-                if newProduction and newProduction ~= display.productionFolder then
-                    display.productionFolder = newProduction
-                    HookProduction(building, newProduction, display.teamFolder)
-                    MarkBuildingDirty(building)
+                local np = torso:FindFirstChild("Producing")
+                if np and np ~= d.productionFolder then
+                    d.productionFolder = np
+                    HookProduction(b, np, d.teamFolder)
+                    MarkBuildingDirty(b)
                 else
-                    display.productionFolder = newProduction
+                    d.productionFolder = np
                 end
             end
-
-            -- Update visibility / position if still alive
-            if not deadBuildings[building] then
-                UpdateOneDisplay(display, camPos, myTeam, myAllies)
+            if not dead[b] then
+                UpdateOneDisplay(d, camPos, myTeam, myAllies)
             end
         end
     end
-	
-	
-
-    -- Remove dead displays
-    for building, _ in pairs(deadBuildings) do
-        local display = ActiveDisplays[building]
-        if display then
-            if display.part then
-                display.part:Destroy()
-            end
-            ActiveDisplays[building] = nil
-        end
+    for b in pairs(dead) do
+        local d = ActiveDisplays[b]
+        if d and d.part then d.part:Destroy() end
+        ActiveDisplays[b] = nil
     end
-end
-
----------------------------------------------------------------
--- CAMERA MOVEMENT EVENT (THROTTLED)
----------------------------------------------------------------
-
-workspace.CurrentCamera:GetPropertyChangedSignal("CFrame"):Connect(function()
-    local now = tick()
-    if now - lastCamUpdate < CAMERA_UPDATE_INTERVAL then
-        return
-    end
-    lastCamUpdate = now
-
-    UpdateAllDisplays()
-end)
-
-
----------------------------------------------------------------
--- SETTINGS CHANGE EVENTS
----------------------------------------------------------------
-
-local function HookSettingRefresh()
-    local function refresh()
-        UpdateAllDisplays()
-    end
-
-    Options.GarrisonHeight:OnChanged(refresh)
-    -- DO NOT hook GarrisonScale here (it already rebuilds UI)
-    Toggles.GarrisonViewEnabled:OnChanged(refresh)
-    Toggles.DistanceCheckEnabled:OnChanged(refresh)
-    Toggles.DisableNearby:OnChanged(refresh)
-    Options.MaxDistance:OnChanged(refresh)
-    Options.NearbyDistance:OnChanged(refresh)
-    Options.IgnoreTargets:OnChanged(refresh)
-end
-
-HookSettingRefresh()
-
-
----------------------------------------------------------------
--- THROTTLED UI UPDATE LOOP (ONCE PER HEARTBEAT, DIRTY ONLY)
----------------------------------------------------------------
-
-local lastDisplayReposition = 0
-local DISPLAY_REPOSITION_INTERVAL = 1 / 144
-
-RunService.Heartbeat:Connect(function()
-    -- Process dirty buildings (rebuild UI)
-    if next(DirtyBuildings) ~= nil then
-        for building, _ in pairs(DirtyBuildings) do
-            local display = ActiveDisplays[building]
-            if display then
-                if display.folder then
-                    UpdateGarrisonDisplay(building, display.folder:GetChildren())
-                end
-                if display.productionFolder and Toggles.ProductionViewEnabled.Value then
-                    BuildProductionRows(display)
-                end
-                UpdateDisplaySize(display)
-            end
-            DirtyBuildings[building] = nil
-        end
-    end
-
-    -- Ensure new/moved displays are positioned even if the camera is still.
-    local now = tick()
-    if now - lastDisplayReposition >= DISPLAY_REPOSITION_INTERVAL then
-        lastDisplayReposition = now
-        UpdateAllDisplays()
-    end
-end)
-
----------------------------------------------------------------
--- HOOK + INIT
----------------------------------------------------------------
-
-local function Hook(building, folder, teamFolder)
-    local display = ActiveDisplays[building]
-    if not display then return end
-    display.hookConnections = display.hookConnections or {}
-
-    local function Refresh()
-        MarkBuildingDirty(building)
-    end
-
-    Refresh()
-
-    table.insert(display.hookConnections, folder.ChildAdded:Connect(function()
-        task.defer(Refresh)
-    end))
-
-    table.insert(display.hookConnections, folder.ChildRemoved:Connect(function()
-        task.defer(Refresh)
-    end))
 end
 
 
 
----------------------------------------------------------------
--- HOOK PRODUCTION FOLDER
----------------------------------------------------------------
-local function HookProduction(building, productionFolder, teamFolder)
-    local display = ActiveDisplays[building]
-    if not display then return end
-    display.hookConnections = display.hookConnections or {}
-
-    display.queueOrder = {}
-    for _, child in ipairs(productionFolder:GetChildren()) do
-        table.insert(display.queueOrder, child)
-    end
-    table.sort(display.queueOrder, function(a,b) return a.Name < b.Name end)
-
-    local function refresh()
-        MarkBuildingDirty(building)
-    end
-
-    table.insert(display.hookConnections, productionFolder.ChildAdded:Connect(function(child)
-        table.insert(display.queueOrder, child)
-        task.defer(refresh)
-    end))
-
-    table.insert(display.hookConnections, productionFolder.ChildRemoved:Connect(function(child)
-        for i, item in ipairs(display.queueOrder) do
-            if item == child then
-                table.remove(display.queueOrder, i)
-                break
-            end
-        end
-        task.defer(refresh)
-    end))
-
-    refresh()
-end
-
-
-
-
-
-
-
-
--- ============================================================
--- === GARRISON BUILDING HOOK SYSTEM (STARTUP + RUNTIME)     ===
--- ============================================================
-
--- STARTUP SCAN (existing buildings)
-for _, teamFolder in ipairs(TeamsFolder:GetChildren()) do
-    for _, building in ipairs(teamFolder:GetChildren()) do
-        if building:IsA("Model") then
-            local torso = building:FindFirstChild("Torso")
-            if torso then
-                local gFolder = torso:FindFirstChild("Garrisoned")
-                local pFolder = torso:FindFirstChild("Producing")
-                if gFolder or pFolder then
-                    CreateDisplay(building, teamFolder)
-                    if gFolder then Hook(building, gFolder, teamFolder) end
-                    if pFolder then HookProduction(building, pFolder, teamFolder) end
+-- Startup scan
+for _, tf in ipairs(TeamsFolder:GetChildren()) do
+    for _, b in ipairs(tf:GetChildren()) do
+        if b:IsA("Model") then
+            local t = b:FindFirstChild("Torso")
+            if t then
+                local g = t:FindFirstChild("Garrisoned")
+                local p = t:FindFirstChild("Producing")
+                if g or p then
+                    CreateDisplay(b, tf)
+                    if g then Hook(b, g, tf) end
+                    if p then HookProduction(b, p, tf) end
                 end
             end
         end
     end
 end
 
+-- ============================================================
+-- NUKE PREDICTOR SYSTEM
+-- ============================================================
+local trackedMissiles = {}
+local persistentMarkers = {}
+local Predictor = { pendingMissiles = {} }
 
-
-
--- ==================================================
--- INSERT THE NEW DYNAMIC HOOK BLOCK RIGHT HERE
--- ==================================================
-
--- Dynamic hook: new buildings spawned after script start
-local function AddBuilding(building, teamFolder)
-    if not building:IsA("Model") then return end
-
-    -- Wait for Torso
-    local torso = nil
-    for i = 1, 20 do
-        task.wait(0.1)
-        torso = building:FindFirstChild("Torso")
-        if torso then break end
-    end
-    if not torso then return end
-
-    -- Wait for either Garrisoned or Producing folder
-    local gFolder = torso:FindFirstChild("Garrisoned")
-    local pFolder = torso:FindFirstChild("Producing")
-    for i = 1, 20 do
-        task.wait(0.1)
-        if not gFolder then gFolder = torso:FindFirstChild("Garrisoned") end
-        if not pFolder then pFolder = torso:FindFirstChild("Producing") end
-        if gFolder or pFolder then break end
-    end
-
-    if not gFolder and not pFolder then return end
-
-    CreateDisplay(building, teamFolder)
-    if gFolder then Hook(building, gFolder, teamFolder) end
-    if pFolder then HookProduction(building, pFolder, teamFolder) end
+function Predictor.onMissileAdded(model)
+    if not model:IsA("Model") then return end
+    if model.Name ~= "Nuclear Missile" and model.Name ~= "Fire Missile" then return end
+    Predictor.pendingMissiles[model] = true
 end
 
--- Hook existing team folders for new buildings
-for _, teamFolder in ipairs(TeamsFolder:GetChildren()) do
-    teamFolder.ChildAdded:Connect(function(building)
-        AddBuilding(building, teamFolder)
-    end)
-end
-
--- Hook team folders that are created later
-TeamsFolder.ChildAdded:Connect(function(teamFolder)
-    for _, building in ipairs(teamFolder:GetChildren()) do
-        AddBuilding(building, teamFolder)
-    end
-    teamFolder.ChildAdded:Connect(function(building)
-        AddBuilding(building, teamFolder)
-    end)
-end)
-
-
-
-
-
--- ============================================================
--- NUKE PREDICTOR (Reverse‑Apex) – with ping marker
--- ============================================================
-local PredictorGroup = Tabs.Main:AddLeftGroupbox('Nuke Predictor')
-
-PredictorGroup:AddToggle('PredictorEnabled', { Text = 'Enable Predictor', Default = true })
-PredictorGroup:AddToggle('PathwayEnabled', { Text = 'Show Pathway', Default = false })
-PredictorGroup:AddDropdown('PathwayDisappear', { Values = { 'On Apex', 'On Impact' }, Default = 'On Apex', Multi = false, Text = 'Pathway Disappears' })
-
--- Marker Color Mode
-PredictorGroup:AddDropdown('MarkerColorMode', {
-    Values = { 'Custom', 'RGB' },
-    Default = 'Custom',
-    Multi = false,
-    Text = 'Marker Color Mode'
-})
-
--- Marker custom colour (only used in Custom mode)
-PredictorGroup:AddLabel('Marker Custom Color'):AddColorPicker('PredictorColor', {
-    Default = Color3.fromRGB(255, 0, 0),
-    Title = 'Prediction Marker Custom'
-})
-
--- Pathway colour
-PredictorGroup:AddLabel('Pathway Color'):AddColorPicker('PathwayColor', {
-    Default = Color3.fromRGB(255, 0, 0),
-    Title = 'Pathway Line Color'
-})
-
-
-
-PredictorGroup:AddSlider('PredictorStayTime', { Text = 'Stay Time (s)', Default = 0, Min = 0, Max = 10, Rounding = 0, Compact = false })
-
--- ------------------------------------------
--- PREDICTOR FUNCTIONS
--- ------------------------------------------
-local function getSiloPosition(missile)
+local function getLaunchInfo(missile)
     local siloVal = missile:FindFirstChild("Silo")
     if siloVal and siloVal:IsA("ObjectValue") and siloVal.Value then
         local silo = siloVal.Value
         if silo:IsA("Model") then
             local torso = silo:FindFirstChild("Torso") or silo:FindFirstChildWhichIsA("BasePart")
-            if torso then return torso.Position end
+            if torso then
+                local root = missile:FindFirstChild("Torso") or missile:FindFirstChildWhichIsA("BasePart")
+                if root then
+                    local dir = (root.Position - torso.Position) * Vector3.new(1,0,1)
+                    if dir.Magnitude > 0.1 then return torso.Position, dir.Unit end
+                end
+            end
         end
     end
-    return nil
+    local obj = missile
+    while obj do
+        if obj:IsA("Model") and obj.Name == "Nuclear Silo" then
+            local part = obj:FindFirstChild("Torso") or obj:FindFirstChildWhichIsA("BasePart")
+            if part then
+                local root = missile:FindFirstChild("Torso") or missile:FindFirstChildWhichIsA("BasePart")
+                if root then
+                    local dir = (root.Position - part.Position) * Vector3.new(1,0,1)
+                    if dir.Magnitude > 0.1 then return part.Position, dir.Unit end
+                end
+            end
+            break
+        end
+        obj = obj.Parent
+    end
+    local root = missile:FindFirstChild("Torso") or missile:FindFirstChildWhichIsA("BasePart")
+    if root then
+        local vel = root.AssemblyLinearVelocity
+        local bv = root:FindFirstChild("BodyVelocity")
+        if bv and bv:IsA("BodyVelocity") then vel = bv.Velocity end
+        local hv = vel * Vector3.new(1,0,1)
+        if hv.Magnitude > 1 then return root.Position, hv.Unit end
+    end
+    return nil, nil
 end
 
 local function getMarkerColor()
-    local mode = Options.MarkerColorMode.Value
-    if mode == 'RGB' then
+    if Options.MarkerColorMode.Value == 'RGB' then
         return getGlobalRGBColor()
-    else
-        return Options.PredictorColor and Options.PredictorColor.Value or Color3.new(1,0,0)
     end
+    return Options.PredictorColor and Options.PredictorColor.Value or Color3.new(1,0,0)
 end
 
--- Create the main predictor disc
 local function createPredictorMarker(position, color)
     local part = Instance.new("Part")
     part.Name = "NukePredictor"
@@ -1639,18 +1773,17 @@ local function createPredictorMarker(position, color)
     part.Shape = Enum.PartType.Cylinder
     part.Anchored = true
     part.CanCollide = false
-    part.CanQuery = false          -- ← NEW: allows clicks to pass through
+    part.CanQuery = false
     part.Material = Enum.Material.Neon
     part.BrickColor = BrickColor.new(color or getMarkerColor())
     part.Transparency = 0.8
     part.CastShadow = false
-    local ray = workspace:Raycast(position + Vector3.new(0, 50, 0), Vector3.new(0, -100, 0))
-    local groundY = ray and ray.Position.Y or 0
-    part.CFrame = CFrame.new(position.X, groundY + 0.5, position.Z) * CFrame.Angles(0, 0, math.rad(90))
+    local ray = workspace:Raycast(position + Vector3.new(0,50,0), Vector3.new(0,-100,0))
+    local gy = ray and ray.Position.Y or 0
+    part.CFrame = CFrame.new(position.X, gy + 0.5, position.Z) * CFrame.Angles(0, 0, math.rad(90))
     part.Parent = workspace
     return part
 end
-
 
 local function createPathway(startPos, direction, groundY)
     local length = 1000
@@ -1659,1805 +1792,457 @@ local function createPathway(startPos, direction, groundY)
     part.Size = Vector3.new(length, 0.2, 2)
     part.Anchored = true
     part.CanCollide = false
-	part.CanQuery = false
+    part.CanQuery = false
     part.Material = Enum.Material.Neon
-    local pathwayColor = Options.PathwayColor and Options.PathwayColor.Value or Color3.new(1,0,0)
-    part.BrickColor = BrickColor.new(pathwayColor)
+    local col = Options.PathwayColor and Options.PathwayColor.Value or Color3.new(1,0,0)
+    part.BrickColor = BrickColor.new(col)
     part.Transparency = 0.8
     part.CastShadow = false
-
     local baseY = groundY or startPos.Y
-    local midPoint = startPos + direction * (length / 2)
-    local flatPos = Vector3.new(midPoint.X, baseY + 0.1, midPoint.Z)
-
-    local up = Vector3.new(0, 1, 0)
+    local mid = startPos + direction * (length / 2)
+    local flat = Vector3.new(mid.X, baseY + 0.1, mid.Z)
+    local up = Vector3.new(0,1,0)
     local right = direction.Unit
     local forward = right:Cross(up).Unit
-    part.CFrame = CFrame.fromMatrix(flatPos, right, up, forward)
+    part.CFrame = CFrame.fromMatrix(flat, right, up, forward)
     part.Parent = workspace
     return part
 end
 
-local function getLaunchInfo(missile)
-    -- 1) Original method: "Silo" ObjectValue
-    local siloVal = missile:FindFirstChild("Silo")
-    if siloVal and siloVal:IsA("ObjectValue") and siloVal.Value then
-        local silo = siloVal.Value
-        if silo:IsA("Model") then
-            local torso = silo:FindFirstChild("Torso") or silo:FindFirstChildWhichIsA("BasePart")
-            if torso then
-                local siloPos = torso.Position
-                local root = missile:FindFirstChild("Torso") or missile:FindFirstChildWhichIsA("BasePart")
-                if root then
-                    local dir = (root.Position - siloPos) * Vector3.new(1, 0, 1)
-                    if dir.Magnitude > 0.1 then
-                        return siloPos, dir.Unit
-                    end
-                end
-            end
-        end
-    end
-
-    -- 2) Walk parent chain for Nuclear Silo model
-    local obj = missile
-    while obj do
-        if obj:IsA("Model") and obj.Name == "Nuclear Silo" then
-            local part = obj:FindFirstChild("Torso") or obj:FindFirstChildWhichIsA("BasePart")
-            if part then
-                local root = missile:FindFirstChild("Torso") or missile:FindFirstChildWhichIsA("BasePart")
-                if root then
-                    local dir = (root.Position - part.Position) * Vector3.new(1, 0, 1)
-                    if dir.Magnitude > 0.1 then
-                        return part.Position, dir.Unit
-                    end
-                end
-            end
-            break
-        end
-        obj = obj.Parent
-    end
-
-    -- 3) Fallback: use missile's BodyVelocity
-    local root = missile:FindFirstChild("Torso") or missile:FindFirstChildWhichIsA("BasePart")
-    if root then
-        local vel = root.AssemblyLinearVelocity
-        local bodyVel = root:FindFirstChild("BodyVelocity")
-        if bodyVel and bodyVel:IsA("BodyVelocity") then
-            vel = bodyVel.Velocity
-        end
-        local horizVel = vel * Vector3.new(1, 0, 1)
-        if horizVel.Magnitude > 1 then
-            return root.Position, horizVel.Unit
-        end
-    end
-
-    return nil, nil
-end
-
--- ------------------------------------------
--- PREDICTOR HEARTBEAT (with ping animation)
--- ------------------------------------------
-local trackedMissiles = {}
-local persistentMarkers = {}
-local debugPrint = false
-
-RunService.Heartbeat:Connect(function()
+local function updatePredictor()
     if not Toggles.PredictorEnabled.Value then
-        for _, data in pairs(trackedMissiles) do
-            if data.marker then data.marker:Destroy() end
-            if data.pathway then data.pathway:Destroy() end
+        for _, d in pairs(trackedMissiles) do
+            if d.marker then d.marker:Destroy() end
+            if d.pathway then d.pathway:Destroy() end
         end
-        for marker, _ in pairs(persistentMarkers) do
-            if marker.Parent then marker:Destroy() end
-        end
+        for m in pairs(persistentMarkers) do if m.Parent then m:Destroy() end end
         trackedMissiles = {}
         persistentMarkers = {}
         return
     end
 
-    -- Update existing marker colors if RGB mode
-    local markerMode = Options.MarkerColorMode.Value
-    if markerMode == 'RGB' then
-        local speed = Options.RGBSpeed and Options.RGBSpeed.Value or 1
-        local rgb = Color3.fromHSV((tick() * speed) % 1, 1, 1)
-        for _, data in pairs(trackedMissiles) do
-            if data.marker and data.marker.Parent then
-                data.marker.BrickColor = BrickColor.new(rgb)
-            end
-            if data.pathway and data.pathway.Parent then
-                data.pathway.BrickColor = BrickColor.new(rgb)
-            end
+    if Options.MarkerColorMode.Value == 'RGB' then
+        local rgb = getGlobalRGBColor()
+        for _, d in pairs(trackedMissiles) do
+            if d.marker and d.marker.Parent then d.marker.BrickColor = BrickColor.new(rgb) end
+            if d.pathway and d.pathway.Parent then d.pathway.BrickColor = BrickColor.new(rgb) end
         end
-        for marker, _ in pairs(persistentMarkers) do
-            if marker.Parent then
-                marker.BrickColor = BrickColor.new(rgb)
-            else
-                persistentMarkers[marker] = nil
+        for m in pairs(persistentMarkers) do
+            if m.Parent then m.BrickColor = BrickColor.new(rgb) else persistentMarkers[m] = nil end
+        end
+    end
+
+    -- Gather from pending (retry each tick until launch info is available or missile dies)
+    for missile in pairs(Predictor.pendingMissiles) do
+        if not missile.Parent then
+            Predictor.pendingMissiles[missile] = nil
+        elseif trackedMissiles[missile] then
+            Predictor.pendingMissiles[missile] = nil
+        else
+            local siloPos, dir = getLaunchInfo(missile)
+            if siloPos and dir then
+                local root = missile:FindFirstChild("Torso") or missile:FindFirstChildWhichIsA("BasePart")
+                if root then
+                    local data = {
+                        startPos = siloPos, direction = dir, maxY = root.Position.Y,
+                        apexReached = false, marker = nil, pathway = nil,
+                    }
+                    trackedMissiles[missile] = data
+                    Predictor.pendingMissiles[missile] = nil
+                    if Toggles.PathwayEnabled.Value then
+                        data.pathway = createPathway(siloPos, dir, siloPos.Y)
+                    end
+                end
             end
         end
     end
 
-    -- Gather current missiles
-    local currentMissiles = {}
-    for _, teamFolder in ipairs(TeamsFolder:GetChildren()) do
-        for _, model in ipairs(teamFolder:GetChildren()) do
-            if model:IsA("Model") and (model.Name == "Nuclear Missile" or model.Name == "Fire Missile") then
-                currentMissiles[model] = true
-            end
-        end
-    end
-
-    -- Remove dead missiles
+    -- Update active missiles
     for missile, data in pairs(trackedMissiles) do
-        if not currentMissiles[missile] then
+        if not missile.Parent then
             local stay = Options.PredictorStayTime.Value
             if data.marker then
                 if stay > 0 then
                     persistentMarkers[data.marker] = true
                     task.delay(stay, function()
-                        if data.marker then
-                            data.marker:Destroy()
-                            persistentMarkers[data.marker] = nil
-                        end
+                        if data.marker then data.marker:Destroy(); persistentMarkers[data.marker] = nil end
                     end)
                 else
                     data.marker:Destroy()
                 end
             end
-            if data.pathway then
-                data.pathway:Destroy()
-            end
+            if data.pathway then data.pathway:Destroy() end
             trackedMissiles[missile] = nil
-        end
-    end
-
-    -- Process active missiles
-    for missile, _ in pairs(currentMissiles) do
-        local data = trackedMissiles[missile]
-        if not data then
-            local siloPos, direction = getLaunchInfo(missile)
-            if siloPos and direction then
-                local root = missile:FindFirstChild("Torso") or missile:FindFirstChildWhichIsA("BasePart")
-                if root then
-                    data = {
-                        startPos = siloPos,
-                        direction = direction,
-                        maxY = root.Position.Y,
-                        apexReached = false,
-                        marker = nil,
-                        pathway = nil,
-                        apexPos = nil
-                    }
-                    trackedMissiles[missile] = data
-
-                    if Toggles.PathwayEnabled.Value then
-                        data.pathway = createPathway(siloPos, direction, siloPos.Y)
-                    end
-                end
-            end
-        end
-
-        if data then
+        else
             local root = missile:FindFirstChild("Torso") or missile:FindFirstChildWhichIsA("BasePart")
             if not root then
                 trackedMissiles[missile] = nil
             else
-                local currentY = root.Position.Y
+                local y = root.Position.Y
                 if not data.apexReached then
-                    if currentY > data.maxY then
-                        data.maxY = currentY
-                    end
-                    if data.maxY - currentY > 0.5 then
+                    if y > data.maxY then data.maxY = y end
+                    if data.maxY - y > 0.5 then
                         data.apexReached = true
-                        data.apexPos = root.Position
-
-                        local horizontalOffset = Vector3.new(root.Position.X - data.startPos.X, 0, root.Position.Z - data.startPos.Z)
-                        local predictedLand = data.startPos + horizontalOffset * 1.8
-
-                        local markerColor = getMarkerColor()
-                        data.marker = createPredictorMarker(predictedLand, markerColor)
-
-                        if debugPrint then print("[Predictor] APEX! Landing:", predictedLand) end
-
-                        if Options.PathwayDisappear.Value == 'On Apex' then
-                            if data.pathway then
-                                data.pathway:Destroy()
-                                data.pathway = nil
-                            end
+                        local offset = Vector3.new(root.Position.X - data.startPos.X, 0, root.Position.Z - data.startPos.Z)
+                        local land = data.startPos + offset * 1.8
+                        data.marker = createPredictorMarker(land, getMarkerColor())
+                        if Options.PathwayDisappear.Value == 'On Apex' and data.pathway then
+                            data.pathway:Destroy(); data.pathway = nil
                         end
                     end
                 end
             end
         end
     end
-end)
-
+end
 
 -- ============================================================
--- NUKE MISC GROUPBOX & LOGIC (audio alerts)
+-- NUKE MISC - sound cache + launch notification
 -- ============================================================
-local NukeMiscGroup = Tabs.Main:AddLeftGroupbox('Nuke Misc')
-
-NukeMiscGroup:AddToggle('NotifyNukeLaunch', { Text = 'Notify Nuke Launch', Default = false })
-NukeMiscGroup:AddToggle('NotifyNukeTeamCheck', { Text = 'Team Check', Default = true })
-
-NukeMiscGroup:AddLabel('Launch Alert Sound')
-NukeMiscGroup:AddDropdown('AlertSound', {
-    Values = { 'None', 'UTHINKIMDUMB', 'LLTNT', 'NEW YEAR NEW ME', 'BHAJLSC', 'DOAFTCS', 'HOW U MAKE OAT MEAL', 'FACTORIO', 'FACTORIO OLD', 'LELOUCH',  'NEOH' },
-    Default = 'UTHINKIMDUMB',
-    Multi = false,
-    Text = 'Alert Sound'
-})
-
--- ---------- SOUND DOWNLOAD & CACHE ----------
 local soundUrls = {
-    ['UTHINKIMDUMB'] = 'https://u.pone.rs/gqtwqctf.mp3',
-    ['LLTNT'] = 'https://u.pone.rs/zzjffmnr.mp3',
-    ['NEW YEAR NEW ME'] = 'https://u.pone.rs/dfparvyq.mp3',
-	['BHAJLSC']  = 'https://u.pone.rs/ldimapzk.mp3',
-	['DOAFTCS']  = 'https://u.pone.rs/gfywjrhv.mp3',
-	['HOW U MAKE OAT MEAL']  = 'https://u.pone.rs/lfbuhrmc.mp3',
-    ['FACTORIO']    = 'https://u.pone.rs/xyypgrho.mp3',
-    ['FACTORIO OLD']  = 'https://u.pone.rs/qjxduqcj.mp3', 
-	['LELOUCH']  = 'https://u.pone.rs/wstbohkr.mp3',
-    ['NEOH']    = 'https://u.pone.rs/cwhtmzkg.ogg',
+    ['UTHINKIMDUMB']       = 'https://u.pone.rs/gqtwqctf.mp3',
+    ['LLTNT']              = 'https://u.pone.rs/zzjffmnr.mp3',
+    ['NEW YEAR NEW ME']    = 'https://u.pone.rs/dfparvyq.mp3',
+    ['BHAJLSC']            = 'https://u.pone.rs/ldimapzk.mp3',
+    ['DOAFTCS']            = 'https://u.pone.rs/gfywjrhv.mp3',
+    ['HOW U MAKE OAT MEAL']= 'https://u.pone.rs/lfbuhrmc.mp3',
+    ['FACTORIO']           = 'https://u.pone.rs/xyypgrho.mp3',
+    ['FACTORIO OLD']       = 'https://u.pone.rs/qjxduqcj.mp3',
+    ['LELOUCH']            = 'https://u.pone.rs/wstbohkr.mp3',
+    ['NEOH']               = 'https://u.pone.rs/cwhtmzkg.ogg',
 }
 local soundCache = {}
 
-local function getSoundAsset(soundName)
-    if soundCache[soundName] then return soundCache[soundName] end
-    local url = soundUrls[soundName]
+local function getSoundAsset(name)
+    if soundCache[name] then return soundCache[name] end
+    local url = soundUrls[name]
     if not url then return nil end
-
-    local success, data = pcall(function() return game:HttpGet(url) end)
-    if not success or not data then
-        warn("[NukeMisc] Failed to download: " .. soundName)
-        return nil
-    end
-
-    local fileName = "CQ3UI/audio/nuke_alert_" .. soundName:gsub(" ", "_") .. ".mp3"
-    writefile(fileName, data)
-    local assetId = getcustomasset(fileName)
-    if not assetId then
-        warn("[NukeMisc] getcustomasset failed for: " .. soundName)
-        return nil
-    end
-    soundCache[soundName] = assetId
-    return assetId
+    local ok, data = pcall(function() return game:HttpGet(url) end)
+    if not ok or not data then return nil end
+    local file = "CQ3UI/audio/nuke_alert_" .. name:gsub(" ", "_") .. ".mp3"
+    writefile(file, data)
+    local asset = getcustomasset(file)
+    soundCache[name] = asset
+    return asset
 end
 
--- Preload all audio assets at script start
-for soundName, url in pairs(soundUrls) do
-    spawn(function()
-        getSoundAsset(soundName)
-    end)
+function playSound(name, volume)
+    if name == 'None' then return end
+    local asset = getSoundAsset(name)
+    if not asset then return end
+    local s = Instance.new("Sound")
+    s.SoundId = asset
+    s.Volume = volume or 1
+    s.Parent = workspace
+    s:Play()
+    s.Ended:Connect(function() s:Destroy() end)
 end
 
-local function playSound(soundName, volume)
-    if soundName == 'None' then return end
-    local assetId = getSoundAsset(soundName)
-    if not assetId then return end
-
-    local sound = Instance.new("Sound")
-    sound.SoundId = assetId
-    sound.Volume = volume or 1
-    sound.Parent = workspace
-    sound:Play()
-
-    -- Cleanup when the sound finishes naturally
-    sound.Ended:Connect(function()
-        sound:Destroy()
-    end)
-
-    -- Safety net: check every second if the sound still exists and has stopped playing
-    spawn(function()
-        while sound and sound.Parent do
-            if sound.IsPlaying then
-                task.wait(1)
-            else
-                sound:Destroy()
-                break
-            end
-        end
-    end)
+for name in pairs(soundUrls) do
+    spawn(function() getSoundAsset(name) end)
 end
 
--- Test Sound button
-NukeMiscGroup:AddButton('Test Sound', function()
-    local soundName = Options.AlertSound and Options.AlertSound.Value or 'None'
-    local volume = Options.AlertVolume and Options.AlertVolume.Value or 0.5
-    playSound(soundName, volume)
-end)
-
--- Volume slider
-NukeMiscGroup:AddSlider('AlertVolume', {
-    Text = 'Volume',
-    Default = 1,
-    Min = 0,
-    Max = 1.5,
-    Rounding = 2,
-    Compact = false
-})
-
--- ---------- LOCAL HELPERS (getTeamFolder, etc.) ----------
-local function getTeamFolder(instance)
-    return resolveTeamFolder(instance)
+-- Nuke launch detection - event-driven, not per-frame scanning
+local function playerHistoryForTeam(color)
+    return TeamData.getPlayerHistory(color)
 end
 
 local function getPlayerName(teamColor)
-    local folder = TeamSettings:FindFirstChild(teamColor)
-    if not folder then return "NO PLAYER" end
-    local hist = folder:FindFirstChild("PlayerHistory")
-    if hist then
-        for _, entry in ipairs(hist:GetChildren()) do
-            if Players:FindFirstChild(entry.Name) then return entry.Name end
-        end
+    for _, n in ipairs(playerHistoryForTeam(teamColor)) do
+        if Players:FindFirstChild(n) then return n end
     end
     return "NO PLAYER"
 end
 
 local function shortColorName(teamName)
-    teamName = tostring(teamName):lower()
-    teamName = teamName:gsub("^bright ", ""):gsub("^really ", ""):gsub("^reddish ", "")
+    return string.upper(tostring(teamName):lower()
+        :gsub("^bright ", ""):gsub("^really ", ""):gsub("^reddish ", "")
         :gsub("^deep ", ""):gsub("^pastel ", ""):gsub("^medium ", "")
-        :gsub("^dark ", ""):gsub("^light ", ""):gsub("^%s+", ""):gsub("%s+$", "")
-    return string.upper(teamName)
+        :gsub("^dark ", ""):gsub("^light ", ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
-local function sendNotification(title, text, duration)
-    StarterGui:SetCore("SendNotification", {
-        Title = title,
-        Text = text,
-        Duration = duration or 5
-    })
-end
-
--- ---------- NUKE LAUNCH NOTIFICATION + AUDIO ----------
-local notifiedLaunches = {}
-local debugNuke = false   -- set false to hide speed prints
-
-RunService.Heartbeat:Connect(function()
+local function onMissileLaunched(model)
     if not Toggles.NotifyNukeLaunch.Value then return end
+    local teamFolder = model:FindFirstAncestorOfClass("Model")
+    -- Walk up to the team folder
+    local obj = model
+    while obj and obj.Parent ~= TeamsFolder do obj = obj.Parent end
+    local teamName = obj and obj.Name or "Unknown"
 
-    for _, teamFolder in ipairs(TeamsFolder:GetChildren()) do
-        for _, model in ipairs(teamFolder:GetChildren()) do
-            if model:IsA("Model") and (model.Name == "Nuclear Missile" or model.Name == "Fire Missile") then
-                if not notifiedLaunches[model] then
-                    local root = model:FindFirstChild("Torso") or model:FindFirstChildWhichIsA("BasePart")
-                    if root then
-                        local vel = root.AssemblyLinearVelocity
-                        local bodyVel = root:FindFirstChild("BodyVelocity")
-                        if bodyVel and bodyVel:IsA("BodyVelocity") then vel = bodyVel.Velocity end
-                        local speed = vel.Magnitude
+    if Toggles.NotifyNukeTeamCheck.Value and not TeamData.isEnemy(teamName) then return end
 
-                        if debugNuke and speed > 1 then
-                            print("[NukeMisc] Missile speed:", speed)
-                        end
-
-                        if speed >= 5 then
-                            notifiedLaunches[model] = true
-                            local teamFolder = getTeamFolder(model)
-                            local teamName = teamFolder and teamFolder.Name or "Unknown"
-
-                            local shouldNotify = true
-                            if Toggles.NotifyNukeTeamCheck.Value then
-                                if not IsEnemyTeamColor(teamName) then shouldNotify = false end
-                            end
-
-                            if shouldNotify then
-                                local short = shortColorName(teamName)
-                                local playerName = getPlayerName(teamName)
-                                local missileType = model.Name
-                                local text = short .. " (" .. playerName .. ") HAS LAUNCHED " .. missileType:upper()
-
-                                if debugNuke then print("[NukeMisc] Sending notification:", text) end
-                                sendNotification("☢️ Nuke Launch", text, 5)
-
-                                -- Play selected sound
-                                local soundName = Options.AlertSound and Options.AlertSound.Value or 'None'
-                                local volume = Options.AlertVolume and Options.AlertVolume.Value or 0.5
-                                playSound(soundName, volume)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    for model, _ in pairs(notifiedLaunches) do
-        if not model or not model:IsDescendantOf(TeamsFolder) then
-            notifiedLaunches[model] = nil
-        end
-    end
-end)
-
-
-
-
--- ============================================================
--- SILO ESP GROUPBOX
--- ============================================================
-local SiloESPGroup = Tabs.Main:AddLeftGroupbox('Silo ESP')
-
-SiloESPGroup:AddToggle('SiloESPEnabled', { Text = 'Enable Silo ESP', Default = false })
-SiloESPGroup:AddToggle('SiloESPTeamCheck', { Text = 'Team Check', Default = true })
-SiloESPGroup:AddToggle('SiloESPIgnoreLocal', { Text = 'Ignore Local', Default = true })
-
-SiloESPGroup:AddLabel('Silo Colors')
-SiloESPGroup:AddDivider()
-SiloESPGroup:AddDropdown('SiloColorMode', { Values = { 'Team Color', 'Custom', 'RGB', 'Green, Yellow, Red - No Nuke, Producing, Nuke' }, Default = 'Team Color', Multi = false, Text = 'Silo Color Mode' })
-SiloESPGroup:AddLabel('Silo Outline'):AddColorPicker('SiloOutlineColor', { Default = Color3.fromRGB(255, 100, 100), Title = 'Silo Outline' })
-SiloESPGroup:AddLabel('Silo Inner'):AddColorPicker('SiloInnerColor', { Default = Color3.fromRGB(255, 0, 0), Title = 'Silo Inner' })
-SiloESPGroup:AddSlider('SiloOutlineThickness', { Text = 'Silo Outline Thickness', Default = 1, Min = 0, Max = 1, Rounding = 2, Compact = false })
-
-
--- ============================================================
--- NUKE ESP GROUPBOX
--- ============================================================
-local NukeESPGroup = Tabs.Main:AddLeftGroupbox('Nuke ESP')
-
-NukeESPGroup:AddToggle('NukeESPEnabled', { Text = 'Enable Nuke ESP', Default = false })
-NukeESPGroup:AddToggle('NukeESPTeamCheck', { Text = 'Team Check', Default = true })
-NukeESPGroup:AddToggle('NukeESPIgnoreLocal', { Text = 'Ignore Local', Default = true })
-
-NukeESPGroup:AddLabel('Idle Missile Colors')
-NukeESPGroup:AddDivider()
-NukeESPGroup:AddDropdown('IdleColorMode', { Values = { 'Team Color', 'Custom', 'RGB' }, Default = 'Team Color', Multi = false, Text = 'Idle Color Mode' })
-NukeESPGroup:AddLabel('Idle Outline'):AddColorPicker('IdleOutlineColor', { Default = Color3.fromRGB(255, 100, 100), Title = 'Idle Outline' })
-NukeESPGroup:AddLabel('Idle Inner'):AddColorPicker('IdleInnerColor', { Default = Color3.fromRGB(255, 0, 0), Title = 'Idle Inner' })
-NukeESPGroup:AddSlider('IdleOutlineThickness', { Text = 'Idle Outline Thickness', Default = 1, Min = 0, Max = 1, Rounding = 2, Compact = false })
-
-NukeESPGroup:AddLabel('Moving Missile Colors')
-NukeESPGroup:AddDivider()
-NukeESPGroup:AddDropdown('MovingColorMode', { Values = { 'Team Color', 'Custom', 'RGB' }, Default = 'Team Color', Multi = false, Text = 'Moving Color Mode' })
-NukeESPGroup:AddLabel('Moving Outline'):AddColorPicker('MovingOutlineColor', { Default = Color3.fromRGB(100, 100, 255), Title = 'Moving Outline' })
-NukeESPGroup:AddLabel('Moving Inner'):AddColorPicker('MovingInnerColor', { Default = Color3.fromRGB(0, 0, 255), Title = 'Moving Inner' })
-NukeESPGroup:AddSlider('MovingOutlineThickness', { Text = 'Moving Outline Thickness', Default = 1, Min = 0, Max = 1, Rounding = 2, Compact = false })
-
--- ============================================================
--- ESP HELPERS (shared by Nuke & Silo ESP)
--- ============================================================
-local function GetTeamColorForFolder_ESP(teamFolder)
-    if not teamFolder then return Color3.new(1,1,1) end
-    local ok, brick = pcall(BrickColor.new, teamFolder.Name)
-    if ok and brick then return brick.Color end
-    local TeamsService = game:GetService("Teams")
-    for _, team in ipairs(TeamsService:GetChildren()) do
-        if team.Name == teamFolder.Name and team.TeamColor then
-            return team.TeamColor.Color
-        end
-    end
-    return Color3.new(1,1,1)
+    local short = shortColorName(teamName)
+    local playerName = getPlayerName(teamName)
+    local text = string.format("%s (%s) HAS LAUNCHED %s", short, playerName, model.Name:upper())
+    Notifier.send("☢️ Nuke Launch", text, nil, 5)
+    playSound(Options.AlertSound.Value, Options.AlertVolume.Value)
 end
 
-local function rgbColor()
-    local hue = (tick() * Options.RGBSpeed.Value) % 1
-    return Color3.fromHSV(hue, 1, 1)
-end
-
-local function isMoving(missile)
-    local torso = missile:FindFirstChild("Torso") or missile:FindFirstChildWhichIsA("BasePart")
+-- ============================================================
+-- SILO / NUKE ESP - both use HighlightManager
+-- ============================================================
+local function isMoving(model)
+    local torso = model:FindFirstChild("Torso") or model:FindFirstChildWhichIsA("BasePart")
     if not torso then return false end
-    local bodyVel = torso:FindFirstChild("BodyVelocity")
-    local vel = bodyVel and bodyVel.Velocity or torso.AssemblyLinearVelocity
+    local bv = torso:FindFirstChild("BodyVelocity")
+    local vel = bv and bv.Velocity or torso.AssemblyLinearVelocity
     return vel.Magnitude > 5
 end
 
-local function getTeamFolder(instance)
-    return resolveTeamFolder(instance)
+local function isLocalOwner(model)
+    local obj = model
+    while obj and obj.Parent ~= TeamsFolder do obj = obj.Parent end
+    local teamName = obj and obj.Name
+    return teamName == TeamData.getMyTeamColor()
 end
 
-local function isLocalOwner(missile)
-    -- Check if the missile's owning silo is on your team
-    local teamName = getTeamFolder(missile) and getTeamFolder(missile).Name
-    if not teamName then return false end
-
-    local myTeam = GetMyTeamColor()
-    return teamName == myTeam
-end
-
--- Highlight management tables
-local nukeHighlights = {}   -- [model] = { highlight, highlight, ... }
-local siloHighlights = {}   -- [model] = { highlight, ... }
-
-local function applyHighlight(model, outlineColor, innerColor, outlineTransparency, highlightsTable)
-    local highlights = highlightsTable[model]
-    if not highlights then
-        highlights = {}
-        highlightsTable[model] = highlights
-    end
-
-    -- Clean up stale highlights (part destroyed or highlight removed)
-    local alreadyAdorned = {}
-    for i = #highlights, 1, -1 do
-        local hl = highlights[i]
-        if not hl or not hl.Parent or not hl.Adornee or not hl.Adornee.Parent then
-            if hl then hl:Destroy() end
-            table.remove(highlights, i)
-        else
-            alreadyAdorned[hl.Adornee] = true
-        end
-    end
-
-    -- Add highlights for any new parts that appeared since last check
-    for _, child in ipairs(model:GetChildren()) do
-        if child:IsA("BasePart") and not alreadyAdorned[child] then
-            local hl = Instance.new("Highlight")
-            hl.Adornee = child
-            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-            hl.FillTransparency = 0.5
-            hl.Parent = child
-            table.insert(highlights, hl)
-        end
-    end
-
-    -- Apply colors to all current highlights
-    for _, hl in ipairs(highlights) do
-        hl.FillColor = innerColor
-        hl.OutlineColor = outlineColor
-        hl.OutlineTransparency = outlineTransparency
-    end
-end
-
-local function removeHighlight(model, highlightsTable)
-    local highlights = highlightsTable[model]
-    if highlights then
-        for _, hl in ipairs(highlights) do
-            if hl then hl:Destroy() end
-        end
-        highlightsTable[model] = nil
-    end
-end
-
--- Returns "idle", "producing", or "ready" for a given silo model.
---   idle      → nothing in Producing, no ready missile near this silo
---   producing → a missile is inside Producing with Progress < 1
---   ready     → a missile has finished producing (Progress >= 1 in Producing),
---               OR a stationary missile is sitting near this silo's torso in the team folder
 local function siloNukeState(model)
     local torso = model:FindFirstChild("Torso")
     if not torso then return "idle" end
-
-    -- 1) Missile currently in the silo's Producing folder
     local producing = torso:FindFirstChild("Producing")
     if producing then
         for _, child in ipairs(producing:GetChildren()) do
             if child.Name == "Nuclear Missile" or child.Name == "Fire Missile" then
                 local prog = child:FindFirstChild("Progress")
                 if prog and prog:IsA("NumberValue") then
-                    if prog.Value >= 1 then
-                        return "ready"
-                    else
-                        return "producing"
-                    end
-                else
-                    -- No Progress value on the missile → assume it's finished
-                    return "ready"
+                    return prog.Value >= 1 and "ready" or "producing"
                 end
+                return "ready"
             end
         end
     end
-
-    -- 2) Ready missiles sitting in the team folder near this silo.
-    -- Many games don't expose a Silo ObjectValue, so we fall back to proximity:
-    -- any stationary missile whose root is within READY_DISTANCE studs of this silo's
-    -- torso belongs to this silo.
-    local READY_DISTANCE = 40  -- adjust if your silos are larger/smaller
     local teamFolder = model.Parent
     if teamFolder then
-        local siloPos = torso.Position
+        local sp = torso.Position
         for _, obj in ipairs(teamFolder:GetChildren()) do
             if obj:IsA("Model") and (obj.Name == "Nuclear Missile" or obj.Name == "Fire Missile") then
-                local root = obj:FindFirstChild("Torso") or obj:FindFirstChildWhichIsA("BasePart")
-                if root then
-                    local vel = root.AssemblyLinearVelocity.Magnitude
-                    if vel <= 1 then
-                        local dist = (root.Position - siloPos).Magnitude
-                        if dist <= READY_DISTANCE then
-                            return "ready"
-                        end
-                    end
+                local r = obj:FindFirstChild("Torso") or obj:FindFirstChildWhichIsA("BasePart")
+                if r and r.AssemblyLinearVelocity.Magnitude <= 1 then
+                    if (r.Position - sp).Magnitude <= 40 then return "ready" end
                 end
             end
         end
     end
-
     return "idle"
 end
 
--- ============================================================
--- HEARTBEAT: Nuke ESP (missiles) – global RGB sync
--- ============================================================
-RunService.Heartbeat:Connect(function()
-    if not Toggles.NukeESPEnabled.Value then
-        for model, _ in pairs(nukeHighlights) do
-            removeHighlight(model, nukeHighlights)
-        end
-        return
-    end
-
-    for _, teamFolder in ipairs(TeamsFolder:GetChildren()) do
-        for _, model in ipairs(teamFolder:GetChildren()) do
-            if model:IsA("Model") and (model.Name == "Nuclear Missile" or model.Name == "Fire Missile") then
-                local shouldShow = true
-
-                if Toggles.NukeESPTeamCheck.Value then
-                    local teamCol = getTeamFolder(model)
-                    if teamCol and not IsEnemyTeamColor(teamCol.Name) then
-                        shouldShow = false
-                    end
-                end
-
-                if shouldShow and Toggles.NukeESPIgnoreLocal.Value and isLocalOwner(model) then
-                    shouldShow = false
-                end
-
-                if not shouldShow then
-                    removeHighlight(model, nukeHighlights)
-                else
-                    local moving = isMoving(model)
-                    local mode = moving and Options.MovingColorMode.Value or Options.IdleColorMode.Value
-                    local outline, inner, outlineTrans
-
-                    if mode == 'Team Color' then
-                        local teamCol = GetTeamColorForFolder_ESP(getTeamFolder(model))
-                        outline = teamCol:Lerp(Color3.new(0,0,0), 0.3)
-                        inner = teamCol
-                        outlineTrans = 1 - (moving and Options.MovingOutlineThickness.Value or Options.IdleOutlineThickness.Value)
-                    elseif mode == 'RGB' then
-                        inner = getGlobalRGBColor()
-                        outline = inner:Lerp(Color3.new(0,0,0), 0.3)
-                        outlineTrans = 1 - (moving and Options.MovingOutlineThickness.Value or Options.IdleOutlineThickness.Value)
-                    else -- Custom
-                        outline = moving and Options.MovingOutlineColor.Value or Options.IdleOutlineColor.Value
-                        inner = moving and Options.MovingInnerColor.Value or Options.IdleInnerColor.Value
-                        outlineTrans = 1 - (moving and Options.MovingOutlineThickness.Value or Options.IdleOutlineThickness.Value)
-                    end
-
-                    applyHighlight(model, outline, inner, outlineTrans, nukeHighlights)
-                end
-            end
-        end
-    end
-
-    for model, _ in pairs(nukeHighlights) do
-        if not model or not model:IsDescendantOf(TeamsFolder) then
-            removeHighlight(model, nukeHighlights)
-        end
-    end
-end)
-
--- Instantly highlight new missiles as they appear
-TeamsFolder.DescendantAdded:Connect(function(descendant)
-    if not Toggles.NukeESPEnabled.Value then return end
-    if not descendant:IsA("Model") then return end
-    if descendant.Name ~= "Nuclear Missile" and descendant.Name ~= "Fire Missile" then return end
-
-    local model = descendant
-    local shouldShow = true
-    if Toggles.NukeESPTeamCheck.Value then
-        local teamCol = getTeamFolder(model)
-        if teamCol and not IsEnemyTeamColor(teamCol.Name) then
-            shouldShow = false
-        end
-    end
-    if shouldShow and Toggles.NukeESPIgnoreLocal.Value and isLocalOwner(model) then
-        shouldShow = false
-    end
-
-    if shouldShow then
-        local moving = isMoving(model)
-        local mode = moving and Options.MovingColorMode.Value or Options.IdleColorMode.Value
-        local outline, inner, outlineTrans
-
-        if mode == 'Team Color' then
-            local teamCol = GetTeamColorForFolder_ESP(getTeamFolder(model))
-            outline = teamCol:Lerp(Color3.new(0,0,0), 0.3)
-            inner = teamCol
-            outlineTrans = 1 - (moving and Options.MovingOutlineThickness.Value or Options.IdleOutlineThickness.Value)
-        elseif mode == 'RGB' then
-            inner = rgbColor()
-            outline = inner:Lerp(Color3.new(0,0,0), 0.3)
-            outlineTrans = 1 - (moving and Options.MovingOutlineThickness.Value or Options.IdleOutlineThickness.Value)
-        else -- Custom
-            outline = moving and Options.MovingOutlineColor.Value or Options.IdleOutlineColor.Value
-            inner = moving and Options.MovingInnerColor.Value or Options.IdleInnerColor.Value
-            outlineTrans = 1 - (moving and Options.MovingOutlineThickness.Value or Options.IdleOutlineThickness.Value)
-        end
-
-        applyHighlight(model, outline, inner, outlineTrans, nukeHighlights)
-    end
-end)
-
-
-
--- ============================================================
--- HEARTBEAT: Silo ESP – global RGB sync
--- ============================================================
-RunService.Heartbeat:Connect(function()
-    if not Toggles.SiloESPEnabled.Value then
-        for model, _ in pairs(siloHighlights) do
-            removeHighlight(model, siloHighlights)
-        end
-        return
-    end
-
-    for _, teamFolder in ipairs(TeamsFolder:GetChildren()) do
-        for _, model in ipairs(teamFolder:GetChildren()) do
-            if model:IsA("Model") and model.Name == "Nuclear Silo" then
-                local shouldShow = true
-
-                if Toggles.SiloESPTeamCheck.Value then
-                    local teamCol = getTeamFolder(model)
-                    if teamCol and not IsEnemyTeamColor(teamCol.Name) then
-                        shouldShow = false
-                    end
-                end
-
-                if not shouldShow then
-                    removeHighlight(model, siloHighlights)
-                else
-                    local mode = Options.SiloColorMode.Value
-                    local outline, inner, outlineTrans
-                    if mode == 'Team Color' then
-                        local teamCol = GetTeamColorForFolder_ESP(getTeamFolder(model))
-                        outline = teamCol:Lerp(Color3.new(0,0,0), 0.3)
-                        inner = teamCol
-                        outlineTrans = 1 - Options.SiloOutlineThickness.Value
-                    elseif mode == 'RGB' then
-                        inner = getGlobalRGBColor()
-                        outline = inner:Lerp(Color3.new(0,0,0), 0.3)
-                        outlineTrans = 1 - Options.SiloOutlineThickness.Value
-                    elseif mode == 'Green, Yellow, Red - No Nuke, Producing, Nuke' then
-                        local state = siloNukeState(model)
-                        if state == "ready" then
-                            inner = Color3.fromRGB(255, 0, 0)     -- red
-                        elseif state == "producing" then
-                            inner = Color3.fromRGB(255, 255, 0)   -- yellow
-                        else
-                            inner = Color3.fromRGB(0, 255, 0)     -- green
-                        end
-                        outline = inner:Lerp(Color3.new(0,0,0), 0.3)
-                        outlineTrans = 1 - Options.SiloOutlineThickness.Value
-                    else
-                        -- Custom
-                        outline = Options.SiloOutlineColor.Value
-                        inner = Options.SiloInnerColor.Value
-                        outlineTrans = 1 - Options.SiloOutlineThickness.Value
-                    end
-
-                    applyHighlight(model, outline, inner, outlineTrans, siloHighlights)
-                end
-            end
-        end
-    end
-
-    for model, _ in pairs(siloHighlights) do
-        if not model or not model:IsDescendantOf(TeamsFolder) then
-            removeHighlight(model, siloHighlights)
-        end
-    end
-end)
-
--- Instantly highlight new silos as they appear
-TeamsFolder.DescendantAdded:Connect(function(descendant)
-    if not Toggles.SiloESPEnabled.Value then return end
-    if not descendant:IsA("Model") then return end
-    if descendant.Name ~= "Nuclear Silo" then return end
-
-    local model = descendant
-    local shouldShow = true
-    if Toggles.SiloESPTeamCheck.Value then
-        local teamCol = getTeamFolder(model)
-        if teamCol and not IsEnemyTeamColor(teamCol.Name) then
-            shouldShow = false
-        end
-    end
-    if shouldShow and Toggles.SiloESPIgnoreLocal.Value and isLocalOwner(model) then
-        shouldShow = false
-    end
-
-    if shouldShow then
-        local mode = Options.SiloColorMode.Value
-        local outline, inner, outlineTrans
-        if mode == 'Team Color' then
-            local teamCol = GetTeamColorForFolder_ESP(getTeamFolder(model))
-            outline = teamCol:Lerp(Color3.new(0,0,0), 0.3)
-            inner = teamCol
-            outlineTrans = 1 - Options.SiloOutlineThickness.Value
-        elseif mode == 'RGB' then
-            inner = rgbColor()
-            outline = inner:Lerp(Color3.new(0,0,0), 0.3)
-            outlineTrans = 1 - Options.SiloOutlineThickness.Value
-        elseif mode == 'Green, Yellow, Red - No Nuke, Producing, Nuke' then
-            local state = siloNukeState(model)
-            if state == "ready" then
-                inner = Color3.fromRGB(255, 0, 0)
-            elseif state == "producing" then
-                inner = Color3.fromRGB(255, 255, 0)
-            else
-                inner = Color3.fromRGB(0, 255, 0)
-            end
-            outline = inner:Lerp(Color3.new(0,0,0), 0.3)
-            outlineTrans = 1 - Options.SiloOutlineThickness.Value
-        else
-            outline = Options.SiloOutlineColor.Value
-            inner = Options.SiloInnerColor.Value
-            outlineTrans = 1 - Options.SiloOutlineThickness.Value
-        end
-
-        applyHighlight(model, outline, inner, outlineTrans, siloHighlights)
-    end
-end)
-
-
--- === NUCLEAR INFORMATION TAB ===
-
-local Alliance1 = Tabs.Nuclear:AddLeftGroupbox("Alliance 1")
-local Alliance2 = Tabs.Nuclear:AddLeftGroupbox("Alliance 2")
-local Alliance3 = Tabs.Nuclear:AddRightGroupbox("Alliance 3")
-
-local AllianceGroups = { Alliance1, Alliance2, Alliance3 }
-local AllianceLabels = {}
-
-for i, group in ipairs(AllianceGroups) do
-    AllianceLabels[i] = group:AddLabel("Loading nuclear data...", true)
-end
-
-local function ResizeAllianceBox(label, groupbox)
-    task.defer(function()
-        local text = label.Text or ""
-        local _, newlineCount = text:gsub("\n", "")
-        local lines = newlineCount + 1
-        local height = 20 + (lines * 14)
-
-        local container = groupbox.Container or (groupbox.Frame and groupbox.Frame.Container)
-        if container then
-            container.Size = UDim2.new(1, 0, 0, height)
-        end
-    end)
-end
-
-----------------------------------------------------------------
--- NUCLEAR ENGINE — MISSILE‑ID VERSION (FINAL)
-----------------------------------------------------------------
-
-local HttpService = game:GetService("HttpService")
-
-local function NE_IsSilo(inst)
-    return inst.Name == "Nuclear Silo"
-end
-
-local function NE_IsMissile(inst)
-    return inst.Name == "Nuclear Missile" or inst.Name == "Fire Missile"
-end
-
-local function NE_GetMissileRoot(m)
-    return m:FindFirstChild("Root") or m:FindFirstChildWhichIsA("BasePart")
-end
-
--- Assign a GUID to each missile once
-local function NE_AssignMissileID(m)
-    if not m:FindFirstChild("MissileID") then
-        local id = Instance.new("StringValue")
-        id.Name = "MissileID"
-        id.Value = HttpService:GenerateGUID(false)
-        id.Parent = m
-    end
-    return m:FindFirstChild("MissileID").Value
-end
-
-local function NE_ScanTeam(teamFolder)
-    local state = {
-        hasSilo   = false,
-        building  = 0,
-
-        -- missileID → pct
-        nukeProd  = {},
-        fireProd  = {},
-
-        -- missileID → true
-        nukeReady = {},
-        fireReady = {},
-
-        -- missileID → true
-        launched  = {},
-
-        queued    = 0,
-    }
-
-    ------------------------------------------------------------
-    -- 1) SCAN SILOS + PRODUCING
-    ------------------------------------------------------------
-    for _, inst in ipairs(teamFolder:GetDescendants()) do
-        if NE_IsSilo(inst) then
-            state.hasSilo = true
-
-            local torso = inst:FindFirstChild("Torso")
-            if torso then
-                -- BUILD PROGRESS
-                local bp = torso:FindFirstChild("BuildProgress")
-                if bp and bp:IsA("NumberValue") then
-                    local v = bp.Value
-                    if v > 0 and v < 1 then
-                        state.building = math.floor(v * 100 + 0.5)
-                    elseif v >= 1 then
-                        state.building = 100
-                    end
-                end
-
-                -- PRODUCING
-                local producing = torso:FindFirstChild("Producing")
-                if producing then
-                    for _, missile in ipairs(producing:GetChildren()) do
-                        if NE_IsMissile(missile) then
-                            state.queued += 1
-
-                            local id = NE_AssignMissileID(missile)
-
-                            local prog = missile:FindFirstChild("Progress")
-                            local pct = prog and math.floor((prog.Value or 0) * 100 + 0.5) or 0
-
-                            if pct > 0 and pct < 100 then
-                                if missile.Name == "Nuclear Missile" then
-                                    state.nukeProd[id] = pct
-                                else
-                                    state.fireProd[id] = pct
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    ------------------------------------------------------------
-    -- 2) READY / LAUNCHED — PER MISSILE, NOT PER TEAM
-    ------------------------------------------------------------
-    for _, tf in ipairs(TeamsFolder:GetChildren()) do
-        for _, obj in ipairs(tf:GetChildren()) do
-            if NE_IsMissile(obj) then
-                local creator = obj:FindFirstChild("Team")
-                local creatorTeam = creator and creator.Value or tf.Name
-
-                -- Only track missiles created by THIS team
-                if creatorTeam == teamFolder.Name then
-                    local id = NE_AssignMissileID(obj)
-
-                    local root = NE_GetMissileRoot(obj)
-                    local vel = root and root.AssemblyLinearVelocity.Magnitude or 0
-
-                    if vel > 1 then
-                        state.launched[id] = true
-                    else
-                        if obj.Name == "Nuclear Missile" then
-                            state.nukeReady[id] = true
-                        else
-                            state.fireReady[id] = true
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    return state
-end
-
-----------------------------------------------------------------
--- PUBLIC API
-----------------------------------------------------------------
-
-function AggregateTeam(teamColor)
-    local teamFolder = TeamsFolder:FindFirstChild(teamColor)
-    if not teamFolder then
-        return {
-            hasSilo   = false,
-            building  = 0,
-            nukeProd  = {},
-            fireProd  = {},
-            nukeReady = {},
-            fireReady = {},
-            launched  = {},
-            queued    = 0,
-        }
-    end
-
-    return NE_ScanTeam(teamFolder)
-end
-
-
--------------------------------------------------
--- TEAM NAME HELPERS
--------------------------------------------------
-
-local TeamColorEmoji = {
-    ["bright red"] = "🟥",
-    ["bright blue"] = "🟦",
-    ["bright green"] = "🟩",
-    ["bright yellow"] = "🟨",
-    ["bright orange"] = "🟧",
-    ["bright violet"] = "🟪",
-    ["reddish brown"] = "🟫",
-    ["really black"] = "⬛",
-    ["really white"] = "⬜"
-}
-
-local function NormalizeTeamName(name)
-    return tostring(name):lower():gsub("_", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function ShortColorName(teamName)
-    teamName = tostring(teamName):lower()
-    teamName = teamName
-        :gsub("^bright ", "")
-        :gsub("^really ", "")
-        :gsub("^reddish ", "")
-        :gsub("^deep ", "")
-        :gsub("^pastel ", "")
-        :gsub("^medium ", "")
-        :gsub("^dark ", "")
-        :gsub("^light ", "")
-        :gsub("^%s+", "")
-        :gsub("%s+$", "")
-    return string.upper(teamName)
-end
-
-local function GetTeamEmoji(teamName)
-    return TeamColorEmoji[NormalizeTeamName(teamName)] or ""
-end
-
--------------------------------------------------
--- ALLIANCE HELPERS
--------------------------------------------------
-
-local function GetPlayersForTeam(teamColor)
-    local folder = TeamSettings:FindFirstChild(teamColor)
-    if not folder then return {} end
-
-    local history = folder:FindFirstChild("PlayerHistory")
-    if not history then return {} end
-
-    local players = {}
-    for _, entry in ipairs(history:GetChildren()) do
-        table.insert(players, entry.Name)
-    end
-
-    return players
-end
-
-local function GetAllAlliances()
-    local alliances = {}
-    local used = {}
-
-    for _, teamFolder in ipairs(TeamSettings:GetChildren()) do
-        local teamColor = teamFolder.Name
-        if not used[teamColor] then
-            local alliance = { teamColor }
-            used[teamColor] = true
-
-            local alliesFolder = teamFolder:FindFirstChild("Allies")
-            if alliesFolder then
-                for _, ally in ipairs(alliesFolder:GetChildren()) do
-                    local allyColor = ally.Name
-                    if TeamSettings:FindFirstChild(allyColor) then
-                        table.insert(alliance, allyColor)
-                        used[allyColor] = true
-                    end
-                end
-            end
-
-            table.insert(alliances, alliance)
-        end
-    end
-
-    return alliances
-end
-
--------------------------------------------------
--- BUILD TEAM BLOCK (SAFE, SHOWS BUILD %)
--------------------------------------------------
-
-local function BuildTeamBlock(teamColor)
-    local state = AggregateTeam(teamColor)
-    local short = ShortColorName(teamColor)
-    local emoji = GetTeamEmoji(teamColor)
-
-    -- resolve player name
-    local normalized = NormalizeTeamName(teamColor)
-    local folder = TeamSettings:FindFirstChild(teamColor)
-    if not folder then
-        for _, child in ipairs(TeamSettings:GetChildren()) do
-            if NormalizeTeamName(child.Name) == normalized then
-                folder = child
-                break
-            end
-        end
-    end
-
-    local playerName = "NO PLAYER"
-    if folder then
-        local hist = folder:FindFirstChild("PlayerHistory")
-        if hist then
-            for _, entry in ipairs(hist:GetChildren()) do
-                if Players:FindFirstChild(entry.Name) then
-                    playerName = entry.Name
-                    break
-                end
-            end
-        end
-    end
-
-    local lines = {}
-    table.insert(lines, string.format("%s%s - %s (%d)", emoji, short, playerName, state.queued or 0))
-
-    if not state.hasSilo then
-        table.insert(lines, "NO SILO FOUND")
-        return table.concat(lines, "\n")
-    end
-
-----------------------------------------------------
--- BUILDING (show only 1–99%)
-----------------------------------------------------
-		if state.building and state.building > 0 and state.building < 100 then
-			table.insert(lines, "SILO BUILDING - (" .. tostring(state.building) .. "%)")
-		end
-
-
-    ----------------------------------------------------
-    -- PRODUCING (creator-aware)
-    ----------------------------------------------------
-    for creatorTeam, pct in pairs(state.nukeProd or {}) do
-        local prefix = (creatorTeam ~= teamColor) and "(" .. ShortColorName(creatorTeam) .. ") - " or ""
-        table.insert(lines, prefix .. "NUKE PRODUCING - (" .. pct .. "%)")
-    end
-
-    for creatorTeam, pct in pairs(state.fireProd or {}) do
-        local prefix = (creatorTeam ~= teamColor) and "(" .. ShortColorName(creatorTeam) .. ") - " or ""
-        table.insert(lines, prefix .. "FIRE PRODUCING - (" .. pct .. "%)")
-    end
-
-    ----------------------------------------------------
-    -- READY (creator-aware)
-    ----------------------------------------------------
-    for creatorTeam in pairs(state.nukeReady or {}) do
-        local prefix = (creatorTeam ~= teamColor) and "(" .. ShortColorName(creatorTeam) .. ") - " or ""
-        table.insert(lines, prefix .. "✅ NUKE READY")
-    end
-
-    for creatorTeam in pairs(state.fireReady or {}) do
-        local prefix = (creatorTeam ~= teamColor) and "(" .. ShortColorName(creatorTeam) .. ") - " or ""
-        table.insert(lines, prefix .. "✅ FNUKE READY")
-    end
-
-    ----------------------------------------------------
-    -- LAUNCHED (creator-aware)
-    ----------------------------------------------------
-    for creatorTeam in pairs(state.launched or {}) do
-        local prefix = (creatorTeam ~= teamColor) and "(" .. ShortColorName(creatorTeam) .. ") - " or ""
-        table.insert(lines, prefix .. "☢️ NUKE LAUNCHED ☢️")
-    end
-
-    ----------------------------------------------------
-    -- IDLE (nothing happening)
-    ----------------------------------------------------
-    local isBuilding = (state.building and state.building > 0 and state.building < 100)
-    local nothingHappening =
-        not isBuilding and
-        next(state.nukeProd or {}) == nil and
-        next(state.fireProd or {}) == nil and
-        next(state.nukeReady or {}) == nil and
-        next(state.fireReady or {}) == nil and
-        next(state.launched or {}) == nil
-
-    if nothingHappening then
-        table.insert(lines, "SILO IS IDLE")
-    end
-
-    return table.concat(lines, "\n")
-end
-
--------------------------------------------------
--- REFRESH UI (NUCLEAR TAB)
--------------------------------------------------
-
-local function RefreshUI()
-    local alliances = GetAllAlliances()
-
-    for i = 1, 3 do
-        local label = AllianceLabels[i]
-        local alliance = alliances[i]
-
-        if not alliance or #alliance == 0 then
-            label:SetText("No alliance data.")
-        else
-            local blocks = {}
-            for _, teamColor in ipairs(alliance) do
-                table.insert(blocks, BuildTeamBlock(teamColor))
-            end
-            label:SetText(table.concat(blocks, "\n\n"))
-        end
-
-        ResizeAllianceBox(label, AllianceGroups[i])
-    end
-end
-
--------------------------------------------------
--- HEARTBEAT UPDATE (NUCLEAR UI ONLY)
--------------------------------------------------
-
-local lastNukeUpdate = 0
-local NUKE_INTERVAL = 0.20
-
-RunService.Heartbeat:Connect(function()
-    local now = tick()
-    if now - lastNukeUpdate < NUKE_INTERVAL then return end
-    lastNukeUpdate = now
-
-    RefreshUI()
-end)
-
-
-
--- ============================================================
--- PLAYER INFO TAB
--- ============================================================
-local PI_Alliance1 = Tabs.PlayerInfo:AddLeftGroupbox("Alliance 1")
-local PI_Alliance2 = Tabs.PlayerInfo:AddLeftGroupbox("Alliance 2")
-local PI_Alliance3 = Tabs.PlayerInfo:AddRightGroupbox("Alliance 3")
-
-local PI_Groups = { PI_Alliance1, PI_Alliance2, PI_Alliance3 }
-local PI_Labels = {}
-
-for i, group in ipairs(PI_Groups) do
-    PI_Labels[i] = group:AddLabel("Loading player data...", true)
-end
-
-local function ResizePIBox(label, groupbox)
-    task.defer(function()
-        local text = label.Text or ""
-        local _, newlineCount = text:gsub("\n", "")
-        local lines = newlineCount + 1
-        local height = 20 + (lines * 14)
-        local container = groupbox.Container or (groupbox.Frame and groupbox.Frame.Container)
-        if container then
-            container.Size = UDim2.new(1, 0, 0, height)
-        end
-    end)
-end
-
--- ---------- HELPERS ----------
-local function formatTime(seconds)
-    if not seconds or seconds == 0 then return "0h 0m" end
-    local hours = math.floor(seconds / 3600)
-    local mins = math.floor((seconds % 3600) / 60)
-    return string.format("%dh %dm", hours, mins)
-end
-
-local function safeFormatDate(unix)
-    if not unix or unix == 0 then return "N/A" end
-    local success, result = pcall(function() return os.date("%d/%m/%y", unix) end)
-    if success then return result else return "N/A" end
-end
-
--- ---------- PLAYER STATS FETCH (online only) ----------
-local function getPlayerStats()
-    local alliances = GetAllAlliances()
-    local output = {}
-
-    for i, alliance in ipairs(alliances) do
-        local blocks = {}
-        local seenPlayers = {}
-
-        -- Collect all player names from PlayerHistory + damage/heal folders
-        for _, teamColor in ipairs(alliance) do
-            local folder = TeamSettings:FindFirstChild(teamColor)
-            if folder then
-                local damageFolder = folder:FindFirstChild("DamageDealt")
-                local healFolder = folder:FindFirstChild("DamageHealed")
-                local history = folder:FindFirstChild("PlayerHistory")
-
-                local playerNames = {}
-                if history then
-                    for _, entry in ipairs(history:GetChildren()) do
-                        table.insert(playerNames, entry.Name)
-                    end
-                end
-                if damageFolder then
-                    for _, val in ipairs(damageFolder:GetChildren()) do
-                        if not table.find(playerNames, val.Name) then
-                            table.insert(playerNames, val.Name)
-                        end
-                    end
-                end
-                if healFolder then
-                    for _, val in ipairs(healFolder:GetChildren()) do
-                        if not table.find(playerNames, val.Name) then
-                            table.insert(playerNames, val.Name)
-                        end
-                    end
-                end
-
-                for _, playerName in ipairs(playerNames) do
-                    if not seenPlayers[playerName] then
-                        seenPlayers[playerName] = { team = teamColor }
-                    end
-                end
-            end
-        end
-
-        -- Build stats only for online players
-        local playerStats = {}
-        for playerName, info in pairs(seenPlayers) do
-            local teamColor = info.team
-            local player = Players:FindFirstChild(playerName)
-            if player then   -- ONLY ONLINE
-                -- Damage/Healed from TeamSettings
-                local damage, healed = 0, 0
-                local teamFolder = TeamSettings:FindFirstChild(teamColor)
-                if teamFolder then
-                    local dmg = teamFolder:FindFirstChild("DamageDealt")
-                    if dmg then
-                        local val = dmg:FindFirstChild(playerName)
-                        if val and val:IsA("NumberValue") then damage = val.Value end
-                    end
-                    local hl = teamFolder:FindFirstChild("DamageHealed")
-                    if hl then
-                        local val = hl:FindFirstChild(playerName)
-                        if val and val:IsA("NumberValue") then healed = val.Value end
-                    end
-                end
-
-                -- Online stats
-                local timePlayed = "N/A"
-                local firstJoin = "N/A"
-                local robuxSpent = "N/A"
-                local highestLevel = "N/A"
-
-                local stats = player:FindFirstChild("Stats")
-                if stats then
-                    local tp = stats:FindFirstChild("timePlayed")
-                    if tp and tp:IsA("NumberValue") then timePlayed = formatTime(tp.Value) end
-                    local fj = stats:FindFirstChild("firstJoinTime")
-                    if fj and fj:IsA("NumberValue") then firstJoin = safeFormatDate(fj.Value) end
-                    local rs = stats:FindFirstChild("robuxSpent")
-                    if rs and rs:IsA("NumberValue") then robuxSpent = tostring(rs.Value) end
-                    local lvls = stats:FindFirstChild("levelsRewarded")
-                    if lvls then
-                        local maxLvl = 0
-                        for _, child in ipairs(lvls:GetChildren()) do
-                            if child:IsA("NumberValue") then
-                                if child.Value > maxLvl then maxLvl = child.Value end
-                            elseif tonumber(child.Name) and tonumber(child.Name) > maxLvl then
-                                maxLvl = tonumber(child.Name)
-                            end
-                        end
-                        if maxLvl > 0 then highestLevel = tostring(maxLvl) end
-                    end
-                end
-
-                table.insert(playerStats, {
-                    name = playerName,
-                    team = teamColor,
-                    damage = damage,
-                    healed = healed,
-                    timePlayed = timePlayed,
-                    firstJoin = firstJoin,
-                    robuxSpent = robuxSpent,
-                    level = highestLevel
-                })
-            end
-        end
-
-        -- Sort by damage descending
-        table.sort(playerStats, function(a, b)
-            return a.damage > b.damage
-        end)
-
-        -- Build text block
-        for _, ps in ipairs(playerStats) do
-            local lines = {}
-            table.insert(lines, string.format("%s%s [%s]",
-                GetTeamEmoji(ps.team),
-                ShortColorName(ps.team),
-                ps.name
-            ))
-            table.insert(lines, string.format("  DMG: %d | HEAL: %d", ps.damage, ps.healed))
-            table.insert(lines, string.format("  Time: %s", ps.timePlayed))
-            table.insert(lines, string.format("  Joined: %s", ps.firstJoin))
-            table.insert(lines, string.format("  Robux: %s", ps.robuxSpent))
-            table.insert(lines, string.format("  Level: %s", ps.level))
-            table.insert(blocks, table.concat(lines, "\n"))
-        end
-
-        if #blocks == 0 then
-            table.insert(blocks, "No online players.")
-        end
-
-        output[i] = table.concat(blocks, "\n\n")
-    end
-
-    return output
-end
-
-local lastPlayerInfoUpdate = 0
-local PI_INTERVAL = 1.0   -- refresh every second
-
-RunService.Heartbeat:Connect(function()
-    local now = tick()
-    if now - lastPlayerInfoUpdate < PI_INTERVAL then return end
-    lastPlayerInfoUpdate = now
-
-    local allianceTexts = getPlayerStats()
-    for i = 1, 3 do
-        if PI_Labels[i] then
-            PI_Labels[i]:SetText(allianceTexts[i] or "No data.")
-            ResizePIBox(PI_Labels[i], PI_Groups[i])
-        end
-    end
-end)
-
-
--- === BUILDING NOTIFICATION FEATURE (REWORKED, ROBLOX NOTIFICATIONS) ===
-
-local BuildingMessages = {
-    ["Airport"] = {
-        msg = "PLACED AN AIRPORT",
-        emoji = "✈️",
-        toggle = "Notify_Airport"
-    },
-    ["Barracks"] = {
-        msg = "PLACED A BARRACKS",
-        emoji = "⚔️",
-        toggle = "Notify_Barracks"
-    },
-    ["Fort"] = {
-        msg = "PLACED A FORT",
-        emoji = "🏰",
-        toggle = "Notify_Fort"
-    },
-    ["Naval Shipyard"] = {
-        msg = "PLACED A NAVAL SHIPYARD",
-        emoji = "⚓",
-        toggle = "Notify_Shipyard"
-    },
-    ["Nuclear Silo"] = {
-        msg = "PLACED A NUCLEAR SILO",
-        emoji = "☢️☢️",
-        toggle = "Notify_Nuke"
-    },
-    ["Shield Generator"] = {
-        msg = "PLACED A SHIELD GENERATOR",
-        emoji = "🛡️",
-        toggle = "Notify_ShieldGen"
-    },
-    ["Space Link"] = {
-        msg = "PLACED A SPACE LINK",
-        emoji = "🛰️",
-        toggle = "Notify_SpaceLink"
-    },
-    ["Tank Factory"] = {
-        msg = "PLACED A TANK FACTORY",
-        emoji = "🚜",
-        toggle = "Notify_TankFactory"
-    }
-}
-
-
-
-local function GetBuilderName(teamColor)
-    local folder = TeamSettings:FindFirstChild(teamColor)
-    if not folder then return "UNKNOWN" end
-
-    local history = folder:FindFirstChild("PlayerHistory")
-    if not history then return "UNKNOWN" end
-
-    for _, entry in ipairs(history:GetChildren()) do
-        local name = entry.Name
-        if Players:FindFirstChild(name) then
-            return name
-        end
-    end
-
-    return "UNKNOWN"
-end
-
-local lastPosition = nil
-
-local function WatchTeam(teamFolder)
-    teamFolder.ChildAdded:Connect(function(building)
-        if not Toggles.NotifyBuildings.Value then return end
-
-        local data = BuildingMessages[building.Name]
-        if not data then return end
-
-        if Toggles[data.toggle] and not Toggles[data.toggle].Value then
-            return
-        end
-
-        local buildingColor = teamFolder.Name
-
-        if Toggles.TeamCheck.Value then
-            if not IsEnemyTeamColor(buildingColor) then
-                return
-            end
-        end
-
-        local shortColor = ShortColorName(buildingColor)
-        local teamEmoji = GetTeamEmoji(buildingColor)
-        local builderName = GetBuilderName(buildingColor)
-
-        local emoji = data.emoji
-        local title = emoji .. " Building Placed " .. emoji
-
-        local text = string.format(
-            "%s%s | %s %s%s",
-            teamEmoji,
-            shortColor,
-            builderName,
-            data.msg,
-            teamEmoji
-        )
-
-        local tpCallback = Instance.new("BindableFunction")
-        tpCallback.OnInvoke = function(btn)
-            if btn ~= "TELEPORT" then return end
-
-            local character = LocalPlayer.Character
-            if not character then return end
-
-            local hrp = character:FindFirstChild("HumanoidRootPart")
-            if not hrp then return end
-
-            lastPosition = hrp.CFrame
-
-            local pivot = building:GetPivot()
-            hrp.CFrame = CFrame.new(pivot.Position + Vector3.new(0, 5, 0))
-
-            local backCallback = Instance.new("BindableFunction")
-            backCallback.OnInvoke = function(b)
-                if b == "GO BACK" and lastPosition then
-                    local char2 = LocalPlayer.Character
-                    if char2 and char2:FindFirstChild("HumanoidRootPart") then
-                        char2.HumanoidRootPart.CFrame = lastPosition
-                    end
-                end
-            end
-
-            StarterGui:SetCore("SendNotification", {
-                Title = "Return?",
-                Text = "Go back to your previous location",
-                Duration = 10,
-                Button1 = "GO BACK",
-                Callback = backCallback
-            })
-        end
-
-        StarterGui:SetCore("SendNotification", {
-            Title = title,
-            Text = text,
-            Duration = 10,
-            Button1 = "TELEPORT",
-            Callback = tpCallback
-        })
-    end)
-end
-
-for _, folder in ipairs(TeamsFolder:GetChildren()) do
-    WatchTeam(folder)
-end
-
-TeamsFolder.ChildAdded:Connect(function(folder)
-    WatchTeam(folder)
-end)
-
-
--- === STANDALONE HIGHLIGHTER (CENTRALIZED CONTROLS) ===
-
-local ActiveHighlights = {} -- [BasePart] = Highlight
-
-local function getAnyAdornee(instance)
-    if instance:IsA("BasePart") or instance:IsA("MeshPart") or instance:IsA("UnionOperation") then
-        return instance
-    end
-    return instance:FindFirstChildWhichIsA("BasePart", true)
-        or instance:FindFirstChildWhichIsA("MeshPart", true)
-        or instance:FindFirstChildWhichIsA("UnionOperation", true)
-end
-
-local function getModelName(instance)
-    local m = instance
-    while m and m ~= TeamsFolder do
-        if m:IsA("Model") then
-            return m.Name
-        end
-        m = m.Parent
-    end
-    return nil
-end
-
--- Returns fill and outline colours based on the selected mode
-local function getHighlightColors()
-    local mode = Options.HighlightMode.Value
+-- Styles
+local function styleSilo(model)
+    local mode = Options.SiloColorMode.Value
+    local outline, inner, oTrans
     if mode == 'Team Color' then
-        return Color3.new(1, 1, 1), Color3.new(0, 0, 0)
+        local col = TeamData.getColor(model)
+        outline = col:Lerp(Color3.new(0,0,0), 0.3)
+        inner = col
+        oTrans = 1 - Options.SiloOutlineThickness.Value
     elseif mode == 'RGB' then
-        local hue = (tick() * 0.5) % 1
-        local rgb = Color3.fromHSV(hue, 1, 1)
-        local outline = rgb:Lerp(Color3.new(0, 0, 0), 0.3)
-        return rgb, outline
-    else -- Custom
-        local fill = Options.HighlightCustomFillColor.Value
-        local outline = Options.HighlightCustomOutlineColor.Value
-        return fill, outline
+        inner = getGlobalRGBColor()
+        outline = inner:Lerp(Color3.new(0,0,0), 0.3)
+        oTrans = 1 - Options.SiloOutlineThickness.Value
+    elseif mode:find("Green, Yellow, Red") then
+        local state = siloNukeState(model)
+        if state == "ready" then inner = Color3.fromRGB(255,0,0)
+        elseif state == "producing" then inner = Color3.fromRGB(255,255,0)
+        else inner = Color3.fromRGB(0,255,0) end
+        outline = inner:Lerp(Color3.new(0,0,0), 0.3)
+        oTrans = 1 - Options.SiloOutlineThickness.Value
+    else
+        outline = Options.SiloOutlineColor.Value
+        inner = Options.SiloInnerColor.Value
+        oTrans = 1 - Options.SiloOutlineThickness.Value
     end
+    return inner, outline, 0.5, oTrans
 end
 
-local function createHighlight(adornee, modelName, teamColor)
-    if not adornee then return end
-    if ActiveHighlights[adornee] and ActiveHighlights[adornee].Parent then
-        return ActiveHighlights[adornee]
+local function styleNuke(model)
+    local moving = isMoving(model)
+    local mode = moving and Options.MovingColorMode.Value or Options.IdleColorMode.Value
+    local outline, inner, oTrans
+    if mode == 'Team Color' then
+        local col = TeamData.getColor(model)
+        outline = col:Lerp(Color3.new(0,0,0), 0.3); inner = col
+        oTrans = 1 - (moving and Options.MovingOutlineThickness.Value or Options.IdleOutlineThickness.Value)
+    elseif mode == 'RGB' then
+        inner = getGlobalRGBColor()
+        outline = inner:Lerp(Color3.new(0,0,0), 0.3)
+        oTrans = 1 - (moving and Options.MovingOutlineThickness.Value or Options.IdleOutlineThickness.Value)
+    else
+        outline = moving and Options.MovingOutlineColor.Value or Options.IdleOutlineColor.Value
+        inner = moving and Options.MovingInnerColor.Value or Options.IdleInnerColor.Value
+        oTrans = 1 - (moving and Options.MovingOutlineThickness.Value or Options.IdleOutlineThickness.Value)
     end
-
-    local fill, outline = getHighlightColors()
-
-    -- If Team Color mode and we have a team colour, override the placeholders
-    if Options.HighlightMode.Value == 'Team Color' and teamColor then
-        fill = teamColor
-        outline = teamColor:Lerp(Color3.new(0, 0, 0), 0.3)
-    end
-
-    local h = Instance.new("Highlight")
-    h.Adornee = adornee
-    h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    h.FillColor = fill
-    h.FillTransparency = Options.HighlightTransparency.Value
-    h.OutlineColor = outline
-    h.OutlineTransparency = 1 - Options.HighlightOutlineThickness.Value
-    h.Parent = adornee
-
-    ActiveHighlights[adornee] = h
-    return h
+    return inner, outline, 0.5, oTrans
 end
 
-function removeHighlightFor(instance)
-    local h = ActiveHighlights[instance]
-    if h then
-        h:Destroy()
-        ActiveHighlights[instance] = nil
-    end
+local nukeRegistered = {}
+local siloRegistered = {}
+
+local function tryRegisterNuke(model)
+    if not Toggles.NukeESPEnabled.Value then return end
+    if model.Name ~= "Nuclear Missile" and model.Name ~= "Fire Missile" then return end
+    if nukeRegistered[model] then return end
+    nukeRegistered[model] = true
+    HighlightManager.attach(model, styleNuke)
 end
 
--- HIGHLIGHT REFRESH DEBOUNCE
-
-local highlightDirty = false
-
-local function RefreshAllHighlights()
-    for adornee, h in pairs(ActiveHighlights) do
-        if h then h:Destroy() end
-    end
-    ActiveHighlights = {}
-    for _, inst in ipairs(TeamsFolder:GetDescendants()) do
-        handleInstance(inst)
-    end
+local function tryRegisterSilo(model)
+    if not Toggles.SiloESPEnabled.Value then return end
+    if model.Name ~= "Nuclear Silo" then return end
+    if siloRegistered[model] then return end
+    siloRegistered[model] = true
+    HighlightManager.attach(model, styleSilo)
 end
 
-local function QueueHighlightRefresh()
-    if highlightDirty then return end
-    highlightDirty = true
-    task.defer(function()
-        highlightDirty = false
-        RefreshAllHighlights()
-    end)
-end
-
-local function HookESPOption(id)
-    if Toggles[id] then
-        Toggles[id]:OnChanged(function()
-            if Toggles.EnableHighlighter.Value then
-                QueueHighlightRefresh()
+-- Fast rescan (only when toggles flip)
+local function rescanNukes()
+    for m in pairs(nukeRegistered) do
+        HighlightManager.detach(m); nukeRegistered[m] = nil
+    end
+    if not Toggles.NukeESPEnabled.Value then return end
+    for _, tf in ipairs(TeamsFolder:GetChildren()) do
+        for _, m in ipairs(tf:GetChildren()) do
+            if m:IsA("Model") and (m.Name == "Nuclear Missile" or m.Name == "Fire Missile") then
+                if not (Toggles.NukeESPTeamCheck.Value and not TeamData.isEnemy(tf.Name))
+                   and not (Toggles.NukeESPIgnoreLocal.Value and isLocalOwner(m)) then
+                    tryRegisterNuke(m)
+                end
             end
-        end)
+        end
     end
-    if Options[id] then
-        Options[id]:OnChanged(function()
-            if Toggles.EnableHighlighter.Value then
-                QueueHighlightRefresh()
+end
+
+local function rescanSilos()
+    for m in pairs(siloRegistered) do
+        HighlightManager.detach(m); siloRegistered[m] = nil
+    end
+    if not Toggles.SiloESPEnabled.Value then return end
+    for _, tf in ipairs(TeamsFolder:GetChildren()) do
+        for _, m in ipairs(tf:GetChildren()) do
+            if m:IsA("Model") and m.Name == "Nuclear Silo" then
+                if not (Toggles.SiloESPTeamCheck.Value and not TeamData.isEnemy(tf.Name))
+                   and not (Toggles.SiloESPIgnoreLocal.Value and isLocalOwner(m)) then
+                    tryRegisterSilo(m)
+                end
             end
-        end)
+        end
     end
 end
 
--- Hook only the unit toggles (no more per‑unit colour pickers)
-local ESP_IDS = {
-    "ESP_Soldier_AntiAir", "ESP_Soldier_Construction", "ESP_Soldier_Hovercraft",
-    "ESP_Soldier_Juggernaut", "ESP_Soldier_Medic", "ESP_Soldier_Sniper",
+Toggles.NukeESPEnabled:OnChanged(rescanNukes)
+Toggles.NukeESPTeamCheck:OnChanged(rescanNukes)
+Toggles.NukeESPIgnoreLocal:OnChanged(rescanNukes)
+Toggles.SiloESPEnabled:OnChanged(rescanSilos)
+Toggles.SiloESPTeamCheck:OnChanged(rescanSilos)
+Toggles.SiloESPIgnoreLocal:OnChanged(rescanSilos)
 
-    "ESP_Air_Helicopter", "ESP_Air_Mothership", "ESP_Air_SpaceFighter",
-    "ESP_Air_StealthBomber", "ESP_Air_TransportPlane",
-
-    "ESP_Tank_AntiAir", "ESP_Tank_Explosive", "ESP_Tank_Heavy",
-
-    "ESP_Navy_AircraftCarrier", "ESP_Navy_TransportShip",
-
-    "ESP_Prod_Airport", "ESP_Prod_Barracks", "ESP_Prod_Fort",
-    "ESP_Prod_Shipyard", "ESP_Prod_SpaceLink", "ESP_Prod_TankFactory",
-    "ESP_Prod_NuclearPlant", "ESP_Prod_PowerPlant",
-
-    "ESP_Build_AntiAirTurret", "ESP_Build_CommandCenter", "ESP_Build_Headquarters",
-    "ESP_Build_NavalHouse", "ESP_Build_PlaneHouse", "ESP_Build_ShieldGen",
-    "ESP_Build_SoldierHouse", "ESP_Build_TankHouse", "ESP_Build_Turret"
-}
-
-for _, id in ipairs(ESP_IDS) do
-    HookESPOption(id .. "_Enabled")
+-- Housekeeping pass: drop highlights for models that no longer exist
+local function espTick()
+    if Toggles.NukeESPEnabled.Value then
+        for m in pairs(nukeRegistered) do
+            if not m.Parent or not m:IsDescendantOf(TeamsFolder) then
+                HighlightManager.detach(m); nukeRegistered[m] = nil
+            end
+        end
+    end
+    if Toggles.SiloESPEnabled.Value then
+        for m in pairs(siloRegistered) do
+            if not m.Parent or not m:IsDescendantOf(TeamsFolder) then
+                HighlightManager.detach(m); siloRegistered[m] = nil
+            end
+        end
+    end
 end
 
--- Hook team checks
-HookESPOption("ESP_Soldiers_TeamCheck")
-HookESPOption("ESP_Air_TeamCheck")
-HookESPOption("ESP_Tanks_TeamCheck")
-HookESPOption("ESP_Navy_TeamCheck")
-HookESPOption("ESP_Prod_TeamCheck")
-HookESPOption("ESP_Buildings_TeamCheck")
 
--- Hook the new central highlight controls
-HookESPOption("HighlightMode")
-HookESPOption("HighlightCustomFillColor")
-HookESPOption("HighlightCustomOutlineColor")
-HookESPOption("HighlightTransparency")
-HookESPOption("HighlightOutlineThickness")
 
-local function shouldHighlight(modelName)
-    local name = modelName:lower()
 
-    if name == "anti-air soldier" and Toggles.ESP_Soldier_AntiAir_Enabled.Value then return true end
-    if name == "construction soldier" and Toggles.ESP_Soldier_Construction_Enabled.Value then return true end
-    if name == "hovercraft" and Toggles.ESP_Soldier_Hovercraft_Enabled.Value then return true end
-    if name == "juggernaut" and Toggles.ESP_Soldier_Juggernaut_Enabled.Value then return true end
-    if name == "medic" and Toggles.ESP_Soldier_Medic_Enabled.Value then return true end
-    if name == "sniper" and Toggles.ESP_Soldier_Sniper_Enabled.Value then return true end
+-- Unified missile scanner: feeds the predictor AND fires launch notifications.
+-- We can't rely on DescendantAdded here because the game often adds the
+-- missile with a placeholder name and renames it later.
+local notifiedLaunches = {}
 
-    if name == "helicopter" and Toggles.ESP_Air_Helicopter_Enabled.Value then return true end
-    if name == "mothership" and Toggles.ESP_Air_Mothership_Enabled.Value then return true end
-    if name == "space fighter" and Toggles.ESP_Air_SpaceFighter_Enabled.Value then return true end
-    if name == "stealth bomber" and Toggles.ESP_Air_StealthBomber_Enabled.Value then return true end
-    if name == "transport plane" and Toggles.ESP_Air_TransportPlane_Enabled.Value then return true end
+local function nukeLaunchTick()
+    for _, tf in ipairs(TeamsFolder:GetChildren()) do
+        for _, m in ipairs(tf:GetChildren()) do
+            if m:IsA("Model")
+               and (m.Name == "Nuclear Missile" or m.Name == "Fire Missile") then
 
-    if name == "anti-air tank" and Toggles.ESP_Tank_AntiAir_Enabled.Value then return true end
-    if name == "explosive tank" and Toggles.ESP_Tank_Explosive_Enabled.Value then return true end
-    if name == "heavy tank" and Toggles.ESP_Tank_Heavy_Enabled.Value then return true end
+                -- 1) Predictor: queue anything we haven't seen yet
+                if not trackedMissiles[m] and not Predictor.pendingMissiles[m] then
+                    Predictor.pendingMissiles[m] = true
+                end
 
-    if name == "aircraft carrier" and Toggles.ESP_Navy_AircraftCarrier_Enabled.Value then return true end
-    if name == "transport ship" and Toggles.ESP_Navy_TransportShip_Enabled.Value then return true end
+                -- 2) Launch notification: fire once on velocity threshold
+                if Toggles.NotifyNukeLaunch.Value and not notifiedLaunches[m] then
+                    local root = m:FindFirstChild("Torso") or m:FindFirstChildWhichIsA("BasePart")
+                    if root then
+                        local bv = root:FindFirstChild("BodyVelocity")
+                        local vel = bv and bv.Velocity or root.AssemblyLinearVelocity
+                        if vel.Magnitude >= 5 then
+                            notifiedLaunches[m] = true
+                            onMissileLaunched(m)
+                        end
+                    end
+                end
+            end
+        end
+    end
 
-    if name == "airport" and Toggles.ESP_Prod_Airport_Enabled.Value then return true end
-    if name == "barracks" and Toggles.ESP_Prod_Barracks_Enabled.Value then return true end
-    if name == "fort" and Toggles.ESP_Prod_Fort_Enabled.Value then return true end
-    if name == "naval shipyard" and Toggles.ESP_Prod_Shipyard_Enabled.Value then return true end
-    if name == "space link" and Toggles.ESP_Prod_SpaceLink_Enabled.Value then return true end
-    if name == "tank factory" and Toggles.ESP_Prod_TankFactory_Enabled.Value then return true end
-    if name == "nuclear plant" and Toggles.ESP_Prod_NuclearPlant_Enabled.Value then return true end
-    if name == "power plant" and Toggles.ESP_Prod_PowerPlant_Enabled.Value then return true end
+    for m in pairs(notifiedLaunches) do
+        if not m.Parent then notifiedLaunches[m] = nil end
+    end
+end
 
-    if name == "anti-air turret" and Toggles.ESP_Build_AntiAirTurret_Enabled.Value then return true end
-    if name == "command center" and Toggles.ESP_Build_CommandCenter_Enabled.Value then return true end
-    if name == "headquarters" and Toggles.ESP_Build_Headquarters_Enabled.Value then return true end
-    if name == "naval house" and Toggles.ESP_Build_NavalHouse_Enabled.Value then return true end
-    if name == "plane house" and Toggles.ESP_Build_PlaneHouse_Enabled.Value then return true end
-    if name == "shield generator" and Toggles.ESP_Build_ShieldGen_Enabled.Value then return true end
-    if name == "soldier house" and Toggles.ESP_Build_SoldierHouse_Enabled.Value then return true end
-    if name == "tank house" and Toggles.ESP_Build_TankHouse_Enabled.Value then return true end
-    if name == "turret" and Toggles.ESP_Build_Turret_Enabled.Value then return true end
 
+
+
+
+
+-- ============================================================
+-- HIGHLIGHTER (main ESP) - via HighlightManager
+-- ============================================================
+local espHighlighted = {}   -- [part] = {model, team}
+
+local function shouldHighlight(name)
+    name = name:lower()
+    if name == "anti-air soldier"       and Toggles.ESP_Soldier_AntiAir_Enabled.Value then return true end
+    if name == "construction soldier"   and Toggles.ESP_Soldier_Construction_Enabled.Value then return true end
+    if name == "hovercraft"             and Toggles.ESP_Soldier_Hovercraft_Enabled.Value then return true end
+    if name == "juggernaut"             and Toggles.ESP_Soldier_Juggernaut_Enabled.Value then return true end
+    if name == "medic"                  and Toggles.ESP_Soldier_Medic_Enabled.Value then return true end
+    if name == "sniper"                 and Toggles.ESP_Soldier_Sniper_Enabled.Value then return true end
+    if name == "helicopter"             and Toggles.ESP_Air_Helicopter_Enabled.Value then return true end
+    if name == "mothership"             and Toggles.ESP_Air_Mothership_Enabled.Value then return true end
+    if name == "space fighter"          and Toggles.ESP_Air_SpaceFighter_Enabled.Value then return true end
+    if name == "stealth bomber"         and Toggles.ESP_Air_StealthBomber_Enabled.Value then return true end
+    if name == "transport plane"        and Toggles.ESP_Air_TransportPlane_Enabled.Value then return true end
+    if name == "anti-air tank"          and Toggles.ESP_Tank_AntiAir_Enabled.Value then return true end
+    if name == "explosive tank"         and Toggles.ESP_Tank_Explosive_Enabled.Value then return true end
+    if name == "heavy tank"             and Toggles.ESP_Tank_Heavy_Enabled.Value then return true end
+    if name == "aircraft carrier"       and Toggles.ESP_Navy_AircraftCarrier_Enabled.Value then return true end
+    if name == "transport ship"         and Toggles.ESP_Navy_TransportShip_Enabled.Value then return true end
+    if name == "airport"                and Toggles.ESP_Prod_Airport_Enabled.Value then return true end
+    if name == "barracks"               and Toggles.ESP_Prod_Barracks_Enabled.Value then return true end
+    if name == "fort"                   and Toggles.ESP_Prod_Fort_Enabled.Value then return true end
+    if name == "naval shipyard"         and Toggles.ESP_Prod_Shipyard_Enabled.Value then return true end
+    if name == "space link"             and Toggles.ESP_Prod_SpaceLink_Enabled.Value then return true end
+    if name == "tank factory"           and Toggles.ESP_Prod_TankFactory_Enabled.Value then return true end
+    if name == "nuclear plant"          and Toggles.ESP_Prod_NuclearPlant_Enabled.Value then return true end
+    if name == "power plant"            and Toggles.ESP_Prod_PowerPlant_Enabled.Value then return true end
+    if name == "anti-air turret"        and Toggles.ESP_Build_AntiAirTurret_Enabled.Value then return true end
+    if name == "command center"         and Toggles.ESP_Build_CommandCenter_Enabled.Value then return true end
+    if name == "headquarters"           and Toggles.ESP_Build_Headquarters_Enabled.Value then return true end
+    if name == "naval house"            and Toggles.ESP_Build_NavalHouse_Enabled.Value then return true end
+    if name == "plane house"            and Toggles.ESP_Build_PlaneHouse_Enabled.Value then return true end
+    if name == "shield generator"       and Toggles.ESP_Build_ShieldGen_Enabled.Value then return true end
+    if name == "soldier house"          and Toggles.ESP_Build_SoldierHouse_Enabled.Value then return true end
+    if name == "tank house"             and Toggles.ESP_Build_TankHouse_Enabled.Value then return true end
+    if name == "turret"                 and Toggles.ESP_Build_Turret_Enabled.Value then return true end
     return false
 end
 
-local function categoryTeamCheck(modelName)
-    local name = modelName:lower()
-
+local function categoryTeamCheck(name)
+    name = name:lower()
     if name:find("soldier") or name == "hovercraft" or name == "juggernaut" then
         return Toggles.ESP_Soldiers_TeamCheck.Value
     end
@@ -3465,12 +2250,10 @@ local function categoryTeamCheck(modelName)
     or name == "stealth bomber" or name == "transport plane" then
         return Toggles.ESP_Air_TeamCheck.Value
     end
-    if name:find("tank") then
-        return Toggles.ESP_Tanks_TeamCheck.Value
+    if name:find("tank") then return Toggles.ESP_Tanks_TeamCheck.Value end
+    if name == "aircraft carrier" or name == "transport ship" then
+        return Toggles.ESP_Navy_TeamCheck.Value
     end
-	if name == "aircraft carrier" or name == "transport ship" then
-		return Toggles.ESP_Navy_TeamCheck.Value
-	end
     if name == "airport" or name == "barracks" or name == "fort"
     or name == "naval shipyard" or name == "space link" or name == "tank factory"
     or name == "nuclear plant" or name == "power plant" then
@@ -3479,158 +2262,568 @@ local function categoryTeamCheck(modelName)
     return Toggles.ESP_Buildings_TeamCheck.Value
 end
 
-function GetTeamColorFromInstance(inst)
+local function findModelAndTeam(inst)
     local obj = inst
+    local model = nil
     while obj and obj ~= TeamsFolder do
-        if obj.Parent == TeamsFolder then
-            return obj.Name
-        end
+        if not model and obj:IsA("Model") then model = obj end
+        if obj.Parent == TeamsFolder then return model, obj.Name end
         obj = obj.Parent
     end
-    return nil
+    return nil, nil
 end
 
-handleInstance = function(instance)
-    local adornee = getAnyAdornee(instance)
-    if not adornee then return end
-
-    local modelName = getModelName(instance)
-    if not modelName then return end
-
-    if categoryTeamCheck(modelName) then
-        local teamColor = GetTeamColorFromInstance(instance)
-        if teamColor and not IsEnemyTeamColor(teamColor) then
-            return
+local function styleESP(part)
+    local info = espHighlighted[part]
+    if not info then return end
+    local mode = Options.HighlightMode.Value
+    local fill, outline
+    if mode == 'Team Color' then
+        if info.teamColor then
+            fill = info.teamColor
+            outline = info.teamColor:Lerp(Color3.new(0,0,0), 0.3)
+        else
+            fill = Color3.new(1,1,1); outline = Color3.new(0,0,0)
         end
+    elseif mode == 'RGB' then
+        fill = getGlobalRGBColor()
+        outline = fill:Lerp(Color3.new(0,0,0), 0.3)
+    else
+        fill = Options.HighlightCustomFillColor.Value
+        outline = Options.HighlightCustomOutlineColor.Value
     end
+    return fill, outline, Options.HighlightTransparency.Value,
+           1 - Options.HighlightOutlineThickness.Value
+end
 
-    if not shouldHighlight(modelName) then
-        return
-    end
-
-    -- Determine team colour for Team Color mode
+local function espHandleInstance(inst)
+    if not Toggles.EnableHighlighter.Value then return end
+    local part = inst
+    if not (part:IsA("BasePart") or part:IsA("MeshPart") or part:IsA("UnionOperation")) then return end
+    if espHighlighted[part] then return end
+    local model, teamName = findModelAndTeam(inst)
+    if not model then return end
+    local modelName = model.Name
+    if categoryTeamCheck(modelName) and teamName and not TeamData.isEnemy(teamName) then return end
+    if not shouldHighlight(modelName) then return end
     local teamColor = nil
-    if Options.HighlightMode.Value == 'Team Color' then
-        local teamName = GetTeamColorFromInstance(instance)
-        if teamName then
-            teamColor = GetTeamColorForFolder_ESP(TeamsFolder:FindFirstChild(teamName))
-        end
+    if Options.HighlightMode.Value == 'Team Color' and teamName then
+        teamColor = TeamData.getColor(teamName)
     end
-
-    createHighlight(adornee, modelName, teamColor)
+    espHighlighted[part] = { teamColor = teamColor }
+    HighlightManager.attach(part, styleESP)
 end
 
--- Immediately highlight new units / buildings as they appear
-TeamsFolder.DescendantAdded:Connect(function(descendant)
-    if Toggles.EnableHighlighter.Value then
-        handleInstance(descendant)
+local function espClearAll()
+    for part in pairs(espHighlighted) do
+        HighlightManager.detach(part)
     end
-end)
-
-local function startHighlighter()
-    RefreshAllHighlights()
+    espHighlighted = {}
 end
 
-local function stopHighlighter()
-    for adornee, h in pairs(ActiveHighlights) do
-        if h then h:Destroy() end
+local function espRescan()
+    espClearAll()
+    if not Toggles.EnableHighlighter.Value then return end
+    for _, inst in ipairs(TeamsFolder:GetDescendants()) do
+        espHandleInstance(inst)
     end
-    ActiveHighlights = {}
 end
 
 Toggles.EnableHighlighter:OnChanged(function()
-    if Toggles.EnableHighlighter.Value then
-        startHighlighter()
-    else
-        stopHighlighter()
-    end
+    if Toggles.EnableHighlighter.Value then espRescan() else espClearAll() end
 end)
 
+-- Refresh on option changes
+local function hookRefresh(id)
+    local t = Toggles[id] or Options[id]
+    if t and t.OnChanged then
+        t:OnChanged(function()
+            if Toggles.EnableHighlighter.Value then espRescan() end
+        end)
+    end
+end
+for _, id in ipairs({
+    "ESP_Soldier_AntiAir_Enabled","ESP_Soldier_Construction_Enabled","ESP_Soldier_Hovercraft_Enabled",
+    "ESP_Soldier_Juggernaut_Enabled","ESP_Soldier_Medic_Enabled","ESP_Soldier_Sniper_Enabled",
+    "ESP_Air_Helicopter_Enabled","ESP_Air_Mothership_Enabled","ESP_Air_SpaceFighter_Enabled",
+    "ESP_Air_StealthBomber_Enabled","ESP_Air_TransportPlane_Enabled",
+    "ESP_Tank_AntiAir_Enabled","ESP_Tank_Explosive_Enabled","ESP_Tank_Heavy_Enabled",
+    "ESP_Navy_AircraftCarrier_Enabled","ESP_Navy_TransportShip_Enabled",
+    "ESP_Prod_Airport_Enabled","ESP_Prod_Barracks_Enabled","ESP_Prod_Fort_Enabled",
+    "ESP_Prod_Shipyard_Enabled","ESP_Prod_SpaceLink_Enabled","ESP_Prod_TankFactory_Enabled",
+    "ESP_Prod_NuclearPlant_Enabled","ESP_Prod_PowerPlant_Enabled",
+    "ESP_Build_AntiAirTurret_Enabled","ESP_Build_CommandCenter_Enabled","ESP_Build_Headquarters_Enabled",
+    "ESP_Build_NavalHouse_Enabled","ESP_Build_PlaneHouse_Enabled","ESP_Build_ShieldGen_Enabled",
+    "ESP_Build_SoldierHouse_Enabled","ESP_Build_TankHouse_Enabled","ESP_Build_Turret_Enabled",
+    "ESP_Soldiers_TeamCheck","ESP_Air_TeamCheck","ESP_Tanks_TeamCheck","ESP_Navy_TeamCheck",
+    "ESP_Prod_TeamCheck","ESP_Buildings_TeamCheck",
+    "HighlightMode","HighlightCustomFillColor","HighlightCustomOutlineColor",
+    "HighlightTransparency","HighlightOutlineThickness",
+}) do hookRefresh(id) end
 
--- Continuous RGB animation (uses global speed + smoothness)
-local lastRGBUpdate = 0
-RunService.Heartbeat:Connect(function()
-    if not Toggles.EnableHighlighter.Value then return end
-    if Options.HighlightMode.Value ~= 'RGB' then return end
+-- ============================================================
+-- BUILDING NOTIFICATIONS
+-- ============================================================
+local BuildingMessages = {
+    ["Airport"]            = { msg = "PLACED AN AIRPORT",           emoji = "✈️",  toggle = "Notify_Airport" },
+    ["Barracks"]           = { msg = "PLACED A BARRACKS",           emoji = "⚔️",  toggle = "Notify_Barracks" },
+    ["Fort"]               = { msg = "PLACED A FORT",               emoji = "🏰",  toggle = "Notify_Fort" },
+    ["Naval Shipyard"]     = { msg = "PLACED A NAVAL SHIPYARD",     emoji = "⚓",  toggle = "Notify_Shipyard" },
+    ["Nuclear Silo"]       = { msg = "PLACED A NUCLEAR SILO",       emoji = "☢️☢️", toggle = "Notify_Nuke" },
+    ["Shield Generator"]   = { msg = "PLACED A SHIELD GENERATOR",   emoji = "🛡️",  toggle = "Notify_ShieldGen" },
+    ["Space Link"]         = { msg = "PLACED A SPACE LINK",         emoji = "🛰️",  toggle = "Notify_SpaceLink" },
+    ["Tank Factory"]       = { msg = "PLACED A TANK FACTORY",       emoji = "🚜",  toggle = "Notify_TankFactory" },
+}
 
-    local interval = Options.HighlightRGBSmoothness and Options.HighlightRGBSmoothness.Value or 0.01
-    local now = tick()
-    if now - lastRGBUpdate < interval then return end
-    lastRGBUpdate = now
+local function getBuilderName(teamColor)
+    for _, n in ipairs(TeamData.getPlayerHistory(teamColor)) do
+        if Players:FindFirstChild(n) then return n end
+    end
+    return "UNKNOWN"
+end
 
-    local rgb = getGlobalRGBColor()
-    local outline = rgb:Lerp(Color3.new(0, 0, 0), 0.3)
+local lastPlayerPosition = nil
 
-    for adornee, hl in pairs(ActiveHighlights) do
-        if hl and hl.Parent then
-            hl.FillColor = rgb
-            hl.OutlineColor = outline
+local function watchTeam(teamFolder)
+    teamFolder.ChildAdded:Connect(function(building)
+        if not Toggles.NotifyBuildings.Value then return end
+        local data = BuildingMessages[building.Name]
+        if not data then return end
+        if Toggles[data.toggle] and not Toggles[data.toggle].Value then return end
+
+        local color = teamFolder.Name
+        if Toggles.NotifyTeamCheck.Value and not TeamData.isEnemy(color) then return end
+
+        local short = shortColorName(color)
+        local emoji = GetTeamEmoji and GetTeamEmoji(color) or ""
+        local builder = getBuilderName(color)
+
+        local title = data.emoji .. " Building Placed " .. data.emoji
+        local text = string.format("%s%s | %s %s%s", emoji, short, builder, data.msg, emoji)
+
+        Notifier.send(title, text, {
+            {
+                label = "TELEPORT",
+                callback = function()
+                    local char = LocalPlayer.Character
+                    if not char then return end
+                    local hrp = char:FindFirstChild("HumanoidRootPart")
+                    if not hrp then return end
+                    lastPlayerPosition = hrp.CFrame
+                    local pivot = building:GetPivot()
+                    hrp.CFrame = CFrame.new(pivot.Position + Vector3.new(0,5,0))
+                    Notifier.send("Return?", "Go back to your previous location", {
+                        { label = "GO BACK", callback = function()
+                            if lastPlayerPosition then
+                                local c2 = LocalPlayer.Character
+                                if c2 and c2:FindFirstChild("HumanoidRootPart") then
+                                    c2.HumanoidRootPart.CFrame = lastPlayerPosition
+                                end
+                            end
+                        end }
+                    }, 10)
+                end
+            }
+        }, 10)
+    end)
+end
+
+for _, tf in ipairs(TeamsFolder:GetChildren()) do watchTeam(tf) end
+TeamsFolder.ChildAdded:Connect(watchTeam)
+
+-- ============================================================
+-- NUKE INFO TAB LOGIC (event-driven refresh)
+-- ============================================================
+local TeamColorEmoji = {
+    ["bright red"]="🟥", ["bright blue"]="🟦", ["bright green"]="🟩",
+    ["bright yellow"]="🟨", ["bright orange"]="🟧", ["bright violet"]="🟪",
+    ["reddish brown"]="🟫", ["really black"]="⬛", ["really white"]="⬜",
+}
+local function NormalizeTeamName(n) return tostring(n):lower():gsub("_"," "):gsub("%s+"," "):gsub("^%s+",""):gsub("%s+$","") end
+function GetTeamEmoji(name) return TeamColorEmoji[NormalizeTeamName(name)] or "" end
+
+local function NE_IsMissile(i) return i.Name == "Nuclear Missile" or i.Name == "Fire Missile" end
+local function NE_IsSilo(i) return i.Name == "Nuclear Silo" end
+
+local function NE_ScanTeam(teamFolder)
+    local state = {
+        hasSilo = false, building = 0,
+        nukeProd = {}, fireProd = {},
+        nukeReady = {}, fireReady = {},
+        launched = {}, queued = 0,
+    }
+    for _, inst in ipairs(teamFolder:GetDescendants()) do
+        if NE_IsSilo(inst) then
+            state.hasSilo = true
+            local torso = inst:FindFirstChild("Torso")
+            if torso then
+                local bp = torso:FindFirstChild("BuildProgress")
+                if bp and bp:IsA("NumberValue") then
+                    local v = bp.Value
+                    if v > 0 and v < 1 then state.building = math.floor(v * 100 + 0.5)
+                    elseif v >= 1 then state.building = 100 end
+                end
+                local producing = torso:FindFirstChild("Producing")
+                if producing then
+                    for _, missile in ipairs(producing:GetChildren()) do
+                        if NE_IsMissile(missile) then
+                            state.queued = state.queued + 1
+                            local prog = missile:FindFirstChild("Progress")
+                            local pct = prog and math.floor((prog.Value or 0) * 100 + 0.5) or 0
+                            if pct > 0 and pct < 100 then
+                                if missile.Name == "Nuclear Missile" then
+                                    state.nukeProd[missile] = pct
+                                else
+                                    state.fireProd[missile] = pct
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    for _, tf in ipairs(TeamsFolder:GetChildren()) do
+        for _, obj in ipairs(tf:GetChildren()) do
+            if NE_IsMissile(obj) then
+                local creator = obj:FindFirstChild("Team")
+                local creatorTeam = creator and creator.Value or tf.Name
+                if creatorTeam == teamFolder.Name then
+                    local root = obj:FindFirstChild("Root") or obj:FindFirstChildWhichIsA("BasePart")
+                    local vel = root and root.AssemblyLinearVelocity.Magnitude or 0
+                    if vel > 1 then state.launched[obj] = true
+                    elseif obj.Name == "Nuclear Missile" then state.nukeReady[obj] = true
+                    else state.fireReady[obj] = true end
+                end
+            end
+        end
+    end
+    return state
+end
+
+local function BuildTeamBlock(teamColor)
+    local state = NE_ScanTeam(TeamsFolder:FindFirstChild(teamColor) or { GetDescendants = function() return {} end, Name = "" })
+    local short = shortColorName(teamColor)
+    local emoji = GetTeamEmoji(teamColor)
+    local playerName = "NO PLAYER"
+    for _, n in ipairs(TeamData.getPlayerHistory(teamColor)) do
+        if Players:FindFirstChild(n) then playerName = n; break end
+    end
+    local lines = {}
+    table.insert(lines, string.format("%s%s - %s (%d)", emoji, short, playerName, state.queued or 0))
+    if not state.hasSilo then
+        table.insert(lines, "NO SILO FOUND")
+        return table.concat(lines, "\n")
+    end
+    if state.building > 0 and state.building < 100 then
+        table.insert(lines, "SILO BUILDING - (" .. state.building .. "%)")
+    end
+    local nukeProdCount = 0
+    for _ in pairs(state.nukeProd) do nukeProdCount = nukeProdCount + 1 end
+    local fireProdCount = 0
+    for _ in pairs(state.fireProd) do fireProdCount = fireProdCount + 1 end
+    local nukeReadyCount, fireReadyCount, launchedCount = 0, 0, 0
+    for _ in pairs(state.nukeReady) do nukeReadyCount = nukeReadyCount + 1 end
+    for _ in pairs(state.fireReady) do fireReadyCount = fireReadyCount + 1 end
+    for _ in pairs(state.launched) do launchedCount = launchedCount + 1 end
+
+    if nukeProdCount > 0 then table.insert(lines, "NUKE PRODUCING - (" .. state.nukeProd[next(state.nukeProd)] .. "%)") end
+    if fireProdCount > 0 then table.insert(lines, "FIRE PRODUCING - (" .. state.fireProd[next(state.fireProd)] .. "%)") end
+    if nukeReadyCount > 0 then table.insert(lines, "✅ NUKE READY") end
+    if fireReadyCount > 0 then table.insert(lines, "✅ FNUKE READY") end
+    if launchedCount > 0 then table.insert(lines, "☢️ NUKE LAUNCHED ☢️") end
+
+    local nothing = state.building == 0 and nukeProdCount == 0 and fireProdCount == 0
+        and nukeReadyCount == 0 and fireReadyCount == 0 and launchedCount == 0
+    if nothing then table.insert(lines, "SILO IS IDLE") end
+    return table.concat(lines, "\n")
+end
+
+local function RefreshNukeInfo()
+    if not labelIsVisible(NI_Labels[1]) then return end
+    local alliances = TeamData.getAllAlliances()
+    for i = 1, 3 do
+        local lbl, alliance = NI_Labels[i], alliances[i]
+        if not alliance or #alliance == 0 then
+            lbl:SetText("No alliance data.")
         else
-            ActiveHighlights[adornee] = nil
+            local blocks = {}
+            for _, c in ipairs(alliance) do table.insert(blocks, BuildTeamBlock(c)) end
+            lbl:SetText(table.concat(blocks, "\n\n"))
+        end
+        ResizeBox(lbl, NI_Groups[i])
+    end
+end
+
+-- ============================================================
+-- PLAYER INFO TAB LOGIC
+-- ============================================================
+local function formatTime(s)
+    if not s or s == 0 then return "0h 0m" end
+    return string.format("%dh %dm", math.floor(s/3600), math.floor((s%3600)/60))
+end
+local function safeFormatDate(u)
+    if not u or u == 0 then return "N/A" end
+    local ok, r = pcall(function() return os.date("%d/%m/%y", u) end)
+    return ok and r or "N/A"
+end
+
+local function RefreshPlayerInfo()
+    if not labelIsVisible(PI_Labels[1]) then return end
+    local alliances = TeamData.getAllAlliances()
+    local output = {}
+    for i, alliance in ipairs(alliances) do
+        local blocks = {}
+        local seen = {}
+        for _, teamColor in ipairs(alliance) do
+            local folder = TeamSettings:FindFirstChild(teamColor)
+            if folder then
+                local names = {}
+                for _, n in ipairs(TeamData.getPlayerHistory(teamColor)) do
+                    if not seen[n] then seen[n] = teamColor; table.insert(names, n) end
+                end
+                local dmg = folder:FindFirstChild("DamageDealt")
+                if dmg then
+                    for _, v in ipairs(dmg:GetChildren()) do
+                        if not seen[v.Name] then seen[v.Name] = teamColor; table.insert(names, v.Name) end
+                    end
+                end
+                local hl = folder:FindFirstChild("DamageHealed")
+                if hl then
+                    for _, v in ipairs(hl:GetChildren()) do
+                        if not seen[v.Name] then seen[v.Name] = teamColor; table.insert(names, v.Name) end
+                    end
+                end
+            end
+        end
+
+        local stats = {}
+        for name, teamColor in pairs(seen) do
+            local player = Players:FindFirstChild(name)
+            if player then
+                local damage, healed = 0, 0
+                local folder = TeamSettings:FindFirstChild(teamColor)
+                if folder then
+                    local d = folder:FindFirstChild("DamageDealt")
+                    if d then local v = d:FindFirstChild(name); if v and v:IsA("NumberValue") then damage = v.Value end end
+                    local h = folder:FindFirstChild("DamageHealed")
+                    if h then local v = h:FindFirstChild(name); if v and v:IsA("NumberValue") then healed = v.Value end end
+                end
+                local timePlayed, firstJoin, robuxSpent, level = "N/A", "N/A", "N/A", "N/A"
+                local s = player:FindFirstChild("Stats")
+                if s then
+                    local tp = s:FindFirstChild("timePlayed"); if tp and tp:IsA("NumberValue") then timePlayed = formatTime(tp.Value) end
+                    local fj = s:FindFirstChild("firstJoinTime"); if fj and fj:IsA("NumberValue") then firstJoin = safeFormatDate(fj.Value) end
+                    local rs = s:FindFirstChild("robuxSpent"); if rs and rs:IsA("NumberValue") then robuxSpent = tostring(rs.Value) end
+                    local lv = s:FindFirstChild("levelsRewarded")
+                    if lv then
+                        local mx = 0
+                        for _, c in ipairs(lv:GetChildren()) do
+                            local v = c:IsA("NumberValue") and c.Value or tonumber(c.Name)
+                            if v and v > mx then mx = v end
+                        end
+                        if mx > 0 then level = tostring(mx) end
+                    end
+                end
+                table.insert(stats, {
+                    name = name, team = teamColor, damage = damage, healed = healed,
+                    timePlayed = timePlayed, firstJoin = firstJoin,
+                    robuxSpent = robuxSpent, level = level,
+                })
+            end
+        end
+        table.sort(stats, function(a, b) return a.damage > b.damage end)
+        for _, ps in ipairs(stats) do
+            local lines = {}
+            table.insert(lines, string.format("%s%s [%s]", GetTeamEmoji(ps.team), shortColorName(ps.team), ps.name))
+            table.insert(lines, string.format("  DMG: %d | HEAL: %d", ps.damage, ps.healed))
+            table.insert(lines, string.format("  Time: %s", ps.timePlayed))
+            table.insert(lines, string.format("  Joined: %s", ps.firstJoin))
+            table.insert(lines, string.format("  Robux: %s", ps.robuxSpent))
+            table.insert(lines, string.format("  Level: %s", ps.level))
+            table.insert(blocks, table.concat(lines, "\n"))
+        end
+        if #blocks == 0 then table.insert(blocks, "No online players.") end
+        output[i] = table.concat(blocks, "\n\n")
+    end
+    for i = 1, 3 do
+        if PI_Labels[i] then
+            PI_Labels[i]:SetText(output[i] or "No data.")
+            ResizeBox(PI_Labels[i], PI_Groups[i])
+        end
+    end
+end
+
+-- ============================================================
+-- SINGLE HEARTBEAT SCHEDULER
+-- ============================================================
+local INTERVALS = {
+    predictor    = 1/60,
+    espTick      = 1/15,
+    nukeInfo     = 0.2,
+    playerInfo   = 1.0,
+    garrisonSlow = 2.0,   -- fallback for when camera is still
+}
+local accum = { predictor=0, espTick=0, nukeInfo=0, playerInfo=0, garrisonSlow=0 }
+
+
+-- Predictor RGB updates inline (cheap)
+local lastRGBAnim = 0
+
+RunService.Heartbeat:Connect(function(dt)
+    -- Unified highlight tick (applies styles to every registered highlight)
+    HighlightManager.tick()
+
+    -- Subsystem scheduling
+    accum.predictor = accum.predictor + dt
+    if accum.predictor >= INTERVALS.predictor then
+        accum.predictor = 0
+        updatePredictor()
+    end
+
+    accum.espTick = accum.espTick + dt
+    if accum.espTick >= INTERVALS.espTick then
+        accum.espTick = 0
+        espTick()
+    end
+
+    accum.nukeInfo = accum.nukeInfo + dt
+    if accum.nukeInfo >= INTERVALS.nukeInfo then
+        accum.nukeInfo = 0
+        RefreshNukeInfo()
+    end
+
+    accum.playerInfo = accum.playerInfo + dt
+    if accum.playerInfo >= INTERVALS.playerInfo then
+        accum.playerInfo = 0
+        RefreshPlayerInfo()
+    end
+
+    accum.garrisonSlow = accum.garrisonSlow + dt
+    if accum.garrisonSlow >= INTERVALS.garrisonSlow then
+        accum.garrisonSlow = 0
+        UpdateAllDisplays()
+    end
+	
+	
+    accum.nukeNotify = (accum.nukeNotify or 0) + dt
+    if accum.nukeNotify >= 0.3 then
+        accum.nukeNotify = 0
+        nukeLaunchTick()
+        RangeIndicator.maintain()
+    end
+
+
+    -- Garrison dirty rebuild
+    if next(DirtyBuildings) ~= nil then
+        for b in pairs(DirtyBuildings) do
+            local d = ActiveDisplays[b]
+            if d then
+                if d.folder then UpdateGarrisonDisplay(b, d.folder:GetChildren()) end
+                if d.productionFolder and Toggles.ProductionViewEnabled.Value then
+                    BuildProductionRows(d)
+                end
+                UpdateDisplaySize(d)
+            end
+            DirtyBuildings[b] = nil
         end
     end
 end)
 
 
+-- RenderStep follow: garrison + range indicator both update at render rate
+RunService:BindToRenderStep("GarrisonFollow", Enum.RenderPriority.Camera.Value + 1, function()
+    if GARRISON_VIEW_ENABLED and next(ActiveDisplays) ~= nil then
+        local cam = workspace.CurrentCamera
+        if cam then
+            local camPos = cam.CFrame.Position
+            local myTeam = TeamData.getMyTeamColor()
+            local myAllies = TeamData.getMyAlliedColors()
+            for _, d in pairs(ActiveDisplays) do
+                UpdateOneDisplay(d, camPos, myTeam, myAllies)
+            end
+        end
+    end
 
---watermark
+    -- Range rings follow their units every frame
+    RangeIndicator.followTick()
+end)
+
+-- ============================================================
+-- SINGLE DescendantAdded DISPATCHER
+-- ============================================================
+TeamsFolder.DescendantAdded:Connect(function(desc)
+    -- Nuke / silo ESP
+    if desc:IsA("Model") then
+        if desc.Name == "Nuclear Missile" or desc.Name == "Fire Missile" then
+            -- check conditions
+            local tf = desc.Parent
+            if Toggles.NukeESPEnabled.Value then
+                if not (Toggles.NukeESPTeamCheck.Value and tf and not TeamData.isEnemy(tf.Name))
+                and not (Toggles.NukeESPIgnoreLocal.Value and isLocalOwner(desc)) then
+                    tryRegisterNuke(desc)
+                end
+            end
+            -- Predictor tracking
+            Predictor.onMissileAdded(desc)
+			
+        elseif desc.Name == "Nuclear Silo" then
+            if Toggles.SiloESPEnabled.Value then
+                local tf = desc.Parent
+                if not (Toggles.SiloESPTeamCheck.Value and tf and not TeamData.isEnemy(tf.Name))
+                and not (Toggles.SiloESPIgnoreLocal.Value and isLocalOwner(desc)) then
+                    tryRegisterSilo(desc)
+                end
+            end
+        end
+    end
+	
+	    -- Range Indicator
+    RangeIndicator.onAdded(desc)
+
+    -- Main highlighter
+    if Toggles.EnableHighlighter.Value then
+        espHandleInstance(desc)
+    end
+end)
+
+-- ============================================================
+-- WATERMARK + UNLOAD
+-- ============================================================
 Library:SetWatermarkVisibility(true)
 
---fps counter and ping
-
 local FrameTimer = tick()
-local FrameCounter = 0;
-local FPS = 60;
-local WatermarkConnection = game:GetService('RunService').RenderStepped:Connect(function()
-    FrameCounter += 1;
-
+local FrameCounter = 0
+local FPS = 60
+local WatermarkConnection = RunService.RenderStepped:Connect(function()
+    FrameCounter = FrameCounter + 1
     if (tick() - FrameTimer) >= 1 then
-        FPS = FrameCounter;
-        FrameTimer = tick();
-        FrameCounter = 0;
-    end;
-
-    Library:SetWatermark(('LELOUCHWARE V0.10 | %s fps | %s ms'):format(
+        FPS = FrameCounter
+        FrameTimer = tick()
+        FrameCounter = 0
+    end
+    Library:SetWatermark(('LELOUCHWARE V0.11 | %s fps | %s ms'):format(
         math.floor(FPS),
         math.floor(game:GetService('Stats').Network.ServerStatsItem['Data Ping']:GetValue())
-    ));
-end);
+    ))
+end)
 
---keybinds
-Library.KeybindFrame.Visible = false;
+Library.KeybindFrame.Visible = false
 
 Library:OnUnload(function()
     WatermarkConnection:Disconnect()
-
+    HighlightManager.detachAll()
     print('Unloaded!')
     Library.Unloaded = true
 end)
 
-local MenuGroup = Tabs['UI Settings']:AddLeftGroupbox('Menu')
 
-MenuGroup:AddButton('Unload', function()
-    Library:Unload()
+task.delay(2, function()
+    RefreshNukeInfo()
+    RefreshPlayerInfo()
 end)
 
-MenuGroup:AddLabel('Menu bind'):AddKeyPicker('MenuKeybind', {
-    Default = 'End',
-    NoUI = false,
-    Text = 'Menu keybind'
-})
 
-Library.ToggleKeybind = Options.MenuKeybind
 
-ThemeManager:SetLibrary(Library)
-SaveManager:SetLibrary(Library)
-
-SaveManager:IgnoreThemeSettings()
-SaveManager:SetIgnoreIndexes({ 'MenuKeybind' })
-
-ThemeManager:SetFolder('CQ3UI/themes')
-SaveManager:SetFolder('CQ3UI')
-
-SaveManager:BuildConfigSection(Tabs['UI Settings'])
-
-ThemeManager:ApplyToTab(Tabs['UI Settings'])
 
 SaveManager:LoadAutoloadConfig()
