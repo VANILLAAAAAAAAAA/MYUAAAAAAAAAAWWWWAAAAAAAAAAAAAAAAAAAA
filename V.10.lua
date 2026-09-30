@@ -1612,26 +1612,24 @@ function UpdateAllDisplays()
         for _, d in pairs(ActiveDisplays) do d.gui.Enabled = false end
         return
     end
-    if next(ActiveDisplays) == nil then return end
     local cam = workspace.CurrentCamera
     if not cam then return end
     local camPos = cam.CFrame.Position
     local myTeam = TeamData.getMyTeamColor()
     local myAllies = TeamData.getMyAlliedColors()
 
-    -- Scan for new buildings on our team
-    local myTeamFolder = myTeam and TeamsFolder:FindFirstChild(myTeam)
-    if myTeamFolder then
-        for _, b in ipairs(myTeamFolder:GetChildren()) do
+    -- Scan ALL teams (not just own) so new buildings anywhere get displays
+    for _, teamFolder in ipairs(TeamsFolder:GetChildren()) do
+        for _, b in ipairs(teamFolder:GetChildren()) do
             if b:IsA("Model") and not ActiveDisplays[b] then
                 local torso = b:FindFirstChild("Torso")
                 if torso then
                     local g = torso:FindFirstChild("Garrisoned")
                     local p = torso:FindFirstChild("Producing")
                     if g or p then
-                        CreateDisplay(b, myTeamFolder)
-                        if g then Hook(b, g, myTeamFolder) end
-                        if p then HookProduction(b, p, myTeamFolder) end
+                        CreateDisplay(b, teamFolder)
+                        if g then Hook(b, g, teamFolder) end
+                        if p then HookProduction(b, p, teamFolder) end
                     end
                 end
             end
