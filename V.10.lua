@@ -128,6 +128,22 @@ function TeamData.getPlayerHistory(teamColor)
     return names
 end
 
+
+-- Returns the name of the currently-online player on this team, or nil.
+-- Scans Players directly — always fresh, no caching, no invalidation needed.
+function TeamData.getOnlinePlayer(teamColor)
+    if not teamColor then return nil end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.TeamColor and plr.TeamColor.Name == teamColor then
+            return plr.Name
+        end
+    end
+    return nil
+end
+
+
+
+
 function TeamData.getAllAlliances()
     if TeamData._alliances then return TeamData._alliances end
     local alliances, used = {}, {}
@@ -173,6 +189,94 @@ TeamSettings.ChildRemoved:Connect(function(child)
     TeamData.invalidateTeamColor(child.Name)
     TeamData.invalidatePlayerHistory(child.Name)
 end)
+
+-- Watch for any change inside any team's Allies folder.
+-- Uses ChildAdded/ChildRemoved on each Allies folder directly — DescendantRemoved
+-- is not available in every Roblox/executor environment, but these are.
+local _hookedAlliesFolders = setmetatable({}, {__mode = "k"})
+
+local function hookAlliesFolder(alliesFolder)
+    if not alliesFolder then return end
+    if _hookedAlliesFolders[alliesFolder] then return end
+    _hookedAlliesFolders[alliesFolder] = true
+
+    alliesFolder.ChildAdded:Connect(function()
+        TeamData.invalidateMyTeam()
+        TeamData.invalidateAlliances()
+    end)
+    alliesFolder.ChildRemoved:Connect(function()
+        TeamData.invalidateMyTeam()
+        TeamData.invalidateAlliances()
+    end)
+end
+
+-- Hook every Allies folder that already exists at startup
+for _, teamFolder in ipairs(TeamSettings:GetChildren()) do
+    local af = teamFolder:FindFirstChild("Allies")
+    if af then hookAlliesFolder(af) end
+end
+
+-- Hook allies folders for teams that get added later, and handle the case
+-- where a team exists but its Allies folder is created after we started.
+TeamSettings.ChildAdded:Connect(function(child)
+    local af = child:FindFirstChild("Allies")
+    if af then
+        hookAlliesFolder(af)
+    else
+        -- Allies folder may appear later; watch for it
+        child.ChildAdded:Connect(function(sub)
+            if sub.Name == "Allies" then
+                hookAlliesFolder(sub)
+                TeamData.invalidateMyTeam()
+                TeamData.invalidateAlliances()
+            end
+        end)
+    end
+end)
+
+
+
+-- ============================================================
+-- TEAM FOLDER NAME-CHANGE WATCHER
+-- When a player switches colors, the game frequently renames the
+-- TeamSettings folder in place — same Instance, new .Name. ChildAdded
+-- and ChildRemoved do NOT fire for renames, so our name-keyed caches
+-- (_alliances, _myAlliedColors, _teamColorByName) go stale and every
+-- downstream system (Player Info, Nuke Info, isEnemy, getColor) starts
+-- reporting the wrong team. Hook the rename signal and wipe caches.
+-- ============================================================
+local function onTeamRenameOrAddRemove()
+    TeamData._myTeamColor     = nil
+    TeamData._myAlliedColors  = nil
+    TeamData._alliances       = nil
+    TeamData._teamColorByName = {}
+    TeamData._playerHistory   = {}
+end
+
+local _nameWatched = setmetatable({}, {__mode = "k"})
+local function watchTeamName(folder)
+    if not folder or _nameWatched[folder] then return end
+    _nameWatched[folder] = true
+    folder:GetPropertyChangedSignal("Name"):Connect(onTeamRenameOrAddRemove)
+end
+
+for _, f in ipairs(TeamSettings:GetChildren()) do
+    watchTeamName(f)
+end
+
+TeamSettings.ChildAdded:Connect(function(child)
+    watchTeamName(child)
+    onTeamRenameOrAddRemove()
+end)
+
+TeamSettings.ChildRemoved:Connect(function()
+    onTeamRenameOrAddRemove()
+end)
+
+
+
+
+
 
 -- ============================================================
 -- GLOBAL RGB PROVIDER (shared by every ESP subsystem)
@@ -1946,10 +2050,7 @@ local function playerHistoryForTeam(color)
 end
 
 local function getPlayerName(teamColor)
-    for _, n in ipairs(playerHistoryForTeam(teamColor)) do
-        if Players:FindFirstChild(n) then return n end
-    end
-    return "NO PLAYER"
+    return TeamData.getOnlinePlayer(teamColor) or "NO PLAYER"
 end
 
 local function shortColorName(teamName)
@@ -1994,35 +2095,251 @@ local function isLocalOwner(model)
     return teamName == TeamData.getMyTeamColor()
 end
 
-local function siloNukeState(model)
-    local torso = model:FindFirstChild("Torso")
-    if not torso then return "idle" end
+-- ============================================================
+-- Silo state system — event-driven with safety poll.
+--
+-- IMPORTANT game quirk:
+--   A finished missile spawns in the TEAM FOLDER OF THE PLAYER WHO
+--   TRIGGERED PRODUCTION, not the team folder of the silo that built it.
+--   So we cannot correlate by missile.Parent == silo.Parent. The only
+--   reliable signal is a finish-marker: the moment a silo's Producing
+--   folder empties, we timestamp it, and the next new missile is
+--   attributed to whichever silo has the most recent marker.
+-- ============================================================
+local siloState    = setmetatable({}, {__mode = "k"})   -- [silo]    = "idle"|"producing"|"ready"
+local missileOwner = setmetatable({}, {__mode = "k"})   -- [missile] = silo
+local siloJustFinished = setmetatable({}, {__mode = "k"})   -- [silo] = tick()
+local siloProducingSeen = setmetatable({}, {__mode = "k"})  -- [silo] = missile
+
+local FINISH_WINDOW = 15   -- seconds to accept a new missile after a finish
+
+-- Called on every hooked silo per poll. Detects the moment a missile
+-- disappears from Producing, and stamps the silo.
+local function detectFinishTransition(silo)
+    if not silo or not silo.Parent then return end
+    local torso = silo:FindFirstChild("Torso")
+    if not torso then return end
+    local producing = torso:FindFirstChild("Producing")
+    local seen = siloProducingSeen[silo]
+
+    local current = nil
+    if producing then
+        for _, child in ipairs(producing:GetChildren()) do
+            if child.Name == "Nuclear Missile" or child.Name == "Fire Missile" then
+                current = child
+                break
+            end
+        end
+    end
+
+    if current then
+        siloProducingSeen[silo] = current
+    elseif seen then
+        -- Was producing, now empty → production just finished
+        siloJustFinished[silo] = tick()
+        siloProducingSeen[silo] = nil
+    end
+end
+
+-- Claim a finished missile for a silo. Cached; runs once per missile.
+local function claimMissile(missile)
+    local cached = missileOwner[missile]
+    if cached and cached.Parent then return cached end
+
+    -- 1. Silo ObjectValue (authoritative when the game sets it)
+    local siloVal = missile:FindFirstChild("Silo")
+    if siloVal and siloVal:IsA("ObjectValue") and siloVal.Value then
+        local v = siloVal.Value
+        if typeof(v) == "Instance" and v:IsA("Model") and v.Name == "Nuclear Silo" then
+            missileOwner[missile] = v
+            siloJustFinished[v] = nil
+            return v
+        end
+    end
+
+    -- 2. Global finish-marker: whichever silo most recently finished
+    --    producing within the window. This is the ONLY cross-team-safe
+    --    signal — see note above.
+    local now = tick()
+    local best, bestT = nil, 0
+    for silo, t in pairs(siloJustFinished) do
+        if silo.Parent and (now - t) < FINISH_WINDOW then
+            if t > bestT then bestT = t; best = silo end
+        end
+    end
+    if best then
+        missileOwner[missile] = best
+        siloJustFinished[best] = nil
+        return best
+    end
+
+    -- 3. No marker → don't guess. A wrong red silo is worse than a green one.
+    return nil
+end
+
+-- Idle-missile cache, refreshed once per poll pass (cheap, shared).
+local idleMissiles = {}
+local function refreshIdleMissiles()
+    local list = {}
+    for _, tf in ipairs(TeamsFolder:GetChildren()) do
+        for _, m in ipairs(tf:GetChildren()) do
+            if m:IsA("Model") and (m.Name == "Nuclear Missile" or m.Name == "Fire Missile") then
+                local root = m:FindFirstChild("Torso") or m:FindFirstChildWhichIsA("BasePart")
+                if root and root.AssemblyLinearVelocity.Magnitude <= 1 then
+                    table.insert(list, m)
+                end
+            end
+        end
+    end
+    idleMissiles = list
+end
+
+local function recomputeSiloState(silo)
+    if not silo or not silo.Parent then siloState[silo] = nil; return end
+    local torso = silo:FindFirstChild("Torso")
+    if not torso then siloState[silo] = "idle"; return end
+
+    -- 1. A missile is physically in our Producing folder
     local producing = torso:FindFirstChild("Producing")
     if producing then
         for _, child in ipairs(producing:GetChildren()) do
             if child.Name == "Nuclear Missile" or child.Name == "Fire Missile" then
+                missileOwner[child] = silo
                 local prog = child:FindFirstChild("Progress")
-                if prog and prog:IsA("NumberValue") then
-                    return prog.Value >= 1 and "ready" or "producing"
+                if prog and prog:IsA("NumberValue") and prog.Value < 1 then
+                    siloState[silo] = "producing"
+                else
+                    siloState[silo] = "ready"
                 end
-                return "ready"
+                return
             end
         end
     end
-    local teamFolder = model.Parent
-    if teamFolder then
-        local sp = torso.Position
-        for _, obj in ipairs(teamFolder:GetChildren()) do
-            if obj:IsA("Model") and (obj.Name == "Nuclear Missile" or obj.Name == "Fire Missile") then
-                local r = obj:FindFirstChild("Torso") or obj:FindFirstChildWhichIsA("BasePart")
-                if r and r.AssemblyLinearVelocity.Magnitude <= 1 then
-                    if (r.Position - sp).Magnitude <= 40 then return "ready" end
-                end
-            end
+
+    -- 2. We own an idle missile sitting somewhere in the world
+    for _, m in ipairs(idleMissiles) do
+        if missileOwner[m] == silo then
+            siloState[silo] = "ready"
+            return
         end
     end
-    return "idle"
+
+    siloState[silo] = "idle"
 end
+
+local function siloNukeState(model)
+    return siloState[model] or "idle"
+end
+
+-- Hooks
+local siloHooked = setmetatable({}, {__mode = "k"})
+
+local function hookSilo(silo)
+    if siloHooked[silo] then return end
+    siloHooked[silo] = true
+    recomputeSiloState(silo)
+
+    silo.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            siloState[silo] = nil
+            siloHooked[silo] = nil
+            siloJustFinished[silo] = nil
+            siloProducingSeen[silo] = nil
+        end
+    end)
+end
+
+local missileHooked = setmetatable({}, {__mode = "k"})
+
+local function hookMissile(missile)
+    if missileHooked[missile] then return end
+    missileHooked[missile] = true
+
+    local owner = claimMissile(missile)
+    if owner then recomputeSiloState(owner) end
+
+    missile.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            if owner then recomputeSiloState(owner) end
+            missileOwner[missile] = nil
+            missileHooked[missile] = nil
+        end
+    end)
+end
+
+local function scanTeamFolder(teamFolder)
+    if not teamFolder or not teamFolder.Parent then return end
+    for _, child in ipairs(teamFolder:GetChildren()) do
+        if child:IsA("Model") and child.Name == "Nuclear Silo" then
+            hookSilo(child)
+        elseif child:IsA("Model") and (child.Name == "Nuclear Missile" or child.Name == "Fire Missile") then
+            hookMissile(child)
+        end
+    end
+end
+
+-- Initial scan
+for _, teamFolder in ipairs(TeamsFolder:GetChildren()) do
+    scanTeamFolder(teamFolder)
+    teamFolder.ChildAdded:Connect(function(child)
+        task.defer(function()
+            if child:IsA("Model") and child.Name == "Nuclear Silo" then
+                hookSilo(child)
+            elseif child:IsA("Model") and (child.Name == "Nuclear Missile" or child.Name == "Fire Missile") then
+                hookMissile(child)
+            end
+        end)
+    end)
+end
+
+TeamsFolder.ChildAdded:Connect(function(teamFolder)
+    scanTeamFolder(teamFolder)
+    teamFolder.ChildAdded:Connect(function(child)
+        task.defer(function()
+            if child:IsA("Model") and child.Name == "Nuclear Silo" then
+                hookSilo(child)
+            elseif child:IsA("Model") and (child.Name == "Nuclear Missile" or child.Name == "Fire Missile") then
+                hookMissile(child)
+            end
+        end)
+    end)
+end)
+
+-- Poll loop. Two passes:
+--   Pass 1: detect every silo's producing→finished transition and stamp markers.
+--   Pass 2: refresh idle cache, try to claim any unclaimed idle missiles,
+--           then recompute state for each silo.
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+
+        for silo in pairs(siloHooked) do
+            if silo and silo.Parent then
+                detectFinishTransition(silo)
+            end
+        end
+
+        refreshIdleMissiles()
+
+        for _, m in ipairs(idleMissiles) do
+            if not missileOwner[m] then
+                local owner = claimMissile(m)
+                if owner then recomputeSiloState(owner) end
+            end
+        end
+
+        for silo in pairs(siloHooked) do
+            if silo and silo.Parent then
+                recomputeSiloState(silo)
+            else
+                siloHooked[silo] = nil
+                siloState[silo] = nil
+                siloProducingSeen[silo] = nil
+                siloJustFinished[silo] = nil
+            end
+        end
+    end
+end)
 
 -- Styles
 local function styleSilo(model)
@@ -2100,8 +2417,11 @@ local function rescanNukes()
     for _, tf in ipairs(TeamsFolder:GetChildren()) do
         for _, m in ipairs(tf:GetChildren()) do
             if m:IsA("Model") and (m.Name == "Nuclear Missile" or m.Name == "Fire Missile") then
-                if not (Toggles.NukeESPTeamCheck.Value and not TeamData.isEnemy(tf.Name))
-                   and not (Toggles.NukeESPIgnoreLocal.Value and isLocalOwner(m)) then
+                local isLocal = isLocalOwner(m)
+                local isEnemy = TeamData.isEnemy(tf.Name)
+                local hideByTeam  = Toggles.NukeESPTeamCheck.Value and not isEnemy and not isLocal
+                local hideByLocal = Toggles.NukeESPIgnoreLocal.Value and isLocal
+                if not (hideByTeam or hideByLocal) then
                     tryRegisterNuke(m)
                 end
             end
@@ -2117,9 +2437,13 @@ local function rescanSilos()
     for _, tf in ipairs(TeamsFolder:GetChildren()) do
         for _, m in ipairs(tf:GetChildren()) do
             if m:IsA("Model") and m.Name == "Nuclear Silo" then
-                if not (Toggles.SiloESPTeamCheck.Value and not TeamData.isEnemy(tf.Name))
-                   and not (Toggles.SiloESPIgnoreLocal.Value and isLocalOwner(m)) then
+                local isLocal = isLocalOwner(m)
+                local isEnemy = TeamData.isEnemy(tf.Name)
+                local hideByTeam  = Toggles.SiloESPTeamCheck.Value and not isEnemy and not isLocal
+                local hideByLocal = Toggles.SiloESPIgnoreLocal.Value and isLocal
+                if not (hideByTeam or hideByLocal) then
                     tryRegisterSilo(m)
+				    recomputeSiloState(m)
                 end
             end
         end
@@ -2374,10 +2698,7 @@ local BuildingMessages = {
 }
 
 local function getBuilderName(teamColor)
-    for _, n in ipairs(TeamData.getPlayerHistory(teamColor)) do
-        if Players:FindFirstChild(n) then return n end
-    end
-    return "UNKNOWN"
+    return TeamData.getOnlinePlayer(teamColor) or "UNKNOWN"
 end
 
 local lastPlayerPosition = nil
@@ -2503,10 +2824,7 @@ local function BuildTeamBlock(teamColor)
     local state = NE_ScanTeam(TeamsFolder:FindFirstChild(teamColor) or { GetDescendants = function() return {} end, Name = "" })
     local short = shortColorName(teamColor)
     local emoji = GetTeamEmoji(teamColor)
-    local playerName = "NO PLAYER"
-    for _, n in ipairs(TeamData.getPlayerHistory(teamColor)) do
-        if Players:FindFirstChild(n) then playerName = n; break end
-    end
+    local playerName = TeamData.getOnlinePlayer(teamColor) or "NO PLAYER"
     local lines = {}
     table.insert(lines, string.format("%s%s - %s (%d)", emoji, short, playerName, state.queued or 0))
     if not state.hasSilo then
@@ -2574,23 +2892,9 @@ local function RefreshPlayerInfo()
         local blocks = {}
         local seen = {}
         for _, teamColor in ipairs(alliance) do
-            local folder = TeamSettings:FindFirstChild(teamColor)
-            if folder then
-                local names = {}
-                for _, n in ipairs(TeamData.getPlayerHistory(teamColor)) do
-                    if not seen[n] then seen[n] = teamColor; table.insert(names, n) end
-                end
-                local dmg = folder:FindFirstChild("DamageDealt")
-                if dmg then
-                    for _, v in ipairs(dmg:GetChildren()) do
-                        if not seen[v.Name] then seen[v.Name] = teamColor; table.insert(names, v.Name) end
-                    end
-                end
-                local hl = folder:FindFirstChild("DamageHealed")
-                if hl then
-                    for _, v in ipairs(hl:GetChildren()) do
-                        if not seen[v.Name] then seen[v.Name] = teamColor; table.insert(names, v.Name) end
-                    end
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr.TeamColor and plr.TeamColor.Name == teamColor and not seen[plr.Name] then
+                    seen[plr.Name] = teamColor
                 end
             end
         end
@@ -2757,8 +3061,11 @@ TeamsFolder.DescendantAdded:Connect(function(desc)
             -- check conditions
             local tf = desc.Parent
             if Toggles.NukeESPEnabled.Value then
-                if not (Toggles.NukeESPTeamCheck.Value and tf and not TeamData.isEnemy(tf.Name))
-                and not (Toggles.NukeESPIgnoreLocal.Value and isLocalOwner(desc)) then
+                local isLocal = isLocalOwner(desc)
+                local isEnemy = tf and TeamData.isEnemy(tf.Name)
+                local hideByTeam  = Toggles.NukeESPTeamCheck.Value and not isEnemy and not isLocal
+                local hideByLocal = Toggles.NukeESPIgnoreLocal.Value and isLocal
+                if not (hideByTeam or hideByLocal) then
                     tryRegisterNuke(desc)
                 end
             end
@@ -2768,8 +3075,11 @@ TeamsFolder.DescendantAdded:Connect(function(desc)
         elseif desc.Name == "Nuclear Silo" then
             if Toggles.SiloESPEnabled.Value then
                 local tf = desc.Parent
-                if not (Toggles.SiloESPTeamCheck.Value and tf and not TeamData.isEnemy(tf.Name))
-                and not (Toggles.SiloESPIgnoreLocal.Value and isLocalOwner(desc)) then
+                local isLocal = isLocalOwner(desc)
+                local isEnemy = tf and TeamData.isEnemy(tf.Name)
+                local hideByTeam  = Toggles.SiloESPTeamCheck.Value and not isEnemy and not isLocal
+                local hideByLocal = Toggles.SiloESPIgnoreLocal.Value and isLocal
+                if not (hideByTeam or hideByLocal) then
                     tryRegisterSilo(desc)
                 end
             end
