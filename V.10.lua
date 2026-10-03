@@ -1684,7 +1684,10 @@ function Hook(building, folder, teamFolder)
     d.hookConnections = d.hookConnections or {}
     local function Refresh() MarkBuildingDirty(building) end
     Refresh()
+    -- ChildAdded catches new units. DescendantAdded catches Health/MaxHealth
+    -- values that get attached to a unit a tick after the unit itself appears.
     table.insert(d.hookConnections, folder.ChildAdded:Connect(function() task.defer(Refresh) end))
+    table.insert(d.hookConnections, folder.DescendantAdded:Connect(function() task.defer(Refresh) end))
     table.insert(d.hookConnections, folder.ChildRemoved:Connect(function() task.defer(Refresh) end))
 end
 
@@ -2849,7 +2852,7 @@ local function BuildTeamBlock(teamColor)
     if fireReadyCount > 0 then table.insert(lines, "✅ FNUKE READY") end
     if launchedCount > 0 then table.insert(lines, "☢️ NUKE LAUNCHED ☢️") end
 
-    local nothing = state.building == 0 and nukeProdCount == 0 and fireProdCount == 0
+    local nothing = (state.building == 0 or state.building >= 100) and nukeProdCount == 0 and fireProdCount == 0
         and nukeReadyCount == 0 and fireReadyCount == 0 and launchedCount == 0
     if nothing then table.insert(lines, "SILO IS IDLE") end
     return table.concat(lines, "\n")
@@ -3014,6 +3017,22 @@ RunService.Heartbeat:Connect(function(dt)
         nukeLaunchTick()
         RangeIndicator.maintain()
     end
+
+
+    -- Prune dead ESP parts every 2s. Without this, espHighlighted grows
+    -- unbounded as units die, and every heartbeat iterates the dead entries.
+    accum.espPrune = (accum.espPrune or 0) + dt
+    if accum.espPrune >= 10.0 then
+        accum.espPrune = 0
+        for part in pairs(espHighlighted) do
+            if not part.Parent then
+                HighlightManager.detach(part)
+                espHighlighted[part] = nil
+            end
+        end
+    end
+
+
 
 
     -- Garrison dirty rebuild
