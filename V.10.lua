@@ -2111,7 +2111,8 @@ end
 -- ============================================================
 local siloState    = setmetatable({}, {__mode = "k"})   -- [silo]    = "idle"|"producing"|"ready"
 local missileOwner = setmetatable({}, {__mode = "k"})   -- [missile] = silo
-local siloJustFinished = setmetatable({}, {__mode = "k"})   -- [silo] = tick()
+local siloJustFinished = setmetatable({}, {__mode = "k"})   -- [silo] = tick()  (consumed by claimMissile)
+local siloFinishedAt   = setmetatable({}, {__mode = "k"})   -- [silo] = tick()  (persistent, for recompute)
 local siloProducingSeen = setmetatable({}, {__mode = "k"})  -- [silo] = missile
 
 local FINISH_WINDOW = 15   -- seconds to accept a new missile after a finish
@@ -2139,7 +2140,9 @@ local function detectFinishTransition(silo)
         siloProducingSeen[silo] = current
     elseif seen then
         -- Was producing, now empty → production just finished
-        siloJustFinished[silo] = tick()
+        local now = tick()
+        siloJustFinished[silo] = now
+        siloFinishedAt[silo]   = now
         siloProducingSeen[silo] = nil
     end
 end
@@ -2188,8 +2191,12 @@ local function refreshIdleMissiles()
         for _, m in ipairs(tf:GetChildren()) do
             if m:IsA("Model") and (m.Name == "Nuclear Missile" or m.Name == "Fire Missile") then
                 local root = m:FindFirstChild("Torso") or m:FindFirstChildWhichIsA("BasePart")
-                if root and root.AssemblyLinearVelocity.Magnitude <= 1 then
-                    table.insert(list, m)
+                if root then
+                    local bv = root:FindFirstChild("BodyVelocity")
+                    local vel = bv and bv.Velocity or root.AssemblyLinearVelocity
+                    if vel.Magnitude <= 5 then
+                        table.insert(list, m)
+                    end
                 end
             end
         end
@@ -2211,8 +2218,10 @@ local function recomputeSiloState(silo)
                 local prog = child:FindFirstChild("Progress")
                 if prog and prog:IsA("NumberValue") and prog.Value < 1 then
                     siloState[silo] = "producing"
+                    siloFinishedAt[silo] = nil          -- new production, clear stale stamp
                 else
                     siloState[silo] = "ready"
+                    siloFinishedAt[silo] = tick()       -- refresh stamp
                 end
                 return
             end
@@ -2223,8 +2232,57 @@ local function recomputeSiloState(silo)
     for _, m in ipairs(idleMissiles) do
         if missileOwner[m] == silo then
             siloState[silo] = "ready"
+            siloFinishedAt[silo] = tick()
             return
         end
+    end
+
+    -- 3. Fallback: production just finished but the missile hasn't been
+    --    claimed as an idle world missile yet. We MUST verify a real
+    --    missile exists in the workspace — otherwise a cancelled
+    --    production (missile deleted from Producing before launch)
+    --    would falsely display as "ready" (red).
+    --
+    --    Missiles live directly under their team folder, e.g.
+    --      workspace.Teams["Bright blue"].Nuclear Missile
+    --      workspace.Teams["Bright blue"].Fire Missile
+    local fin = siloFinishedAt[silo]
+    if fin and (tick() - fin) < FINISH_WINDOW then
+        -- Walk up to find this silo's team folder
+        local teamFolder = silo
+        while teamFolder and teamFolder.Parent ~= TeamsFolder do
+            teamFolder = teamFolder.Parent
+        end
+
+        local readyMissileExists = false
+        if teamFolder then
+            for _, m in ipairs(teamFolder:GetChildren()) do
+                if m:IsA("Model")
+                   and (m.Name == "Nuclear Missile" or m.Name == "Fire Missile") then
+                    local root = m:FindFirstChild("Torso")
+                        or m:FindFirstChildWhichIsA("BasePart")
+                    if root then
+                        local bv = root:FindFirstChild("BodyVelocity")
+                        local vel = bv and bv.Velocity or root.AssemblyLinearVelocity
+                        -- Only counts if it's idle (not already launched)
+                        if vel.Magnitude <= 5 then
+                            readyMissileExists = true
+                            break
+                        end
+                    end
+                end
+            end
+        end
+
+        if readyMissileExists then
+            siloState[silo] = "ready"
+            return
+        end
+        -- No idle missile exists → cancelled, or the missile already
+        -- launched. Fall through to "idle". We deliberately do NOT
+        -- clear siloFinishedAt here, so if the missile is reparented
+        -- into the team folder a tick later (transitional window),
+        -- the next poll still flips us to ready.
     end
 
     siloState[silo] = "idle"
@@ -2247,6 +2305,7 @@ local function hookSilo(silo)
             siloState[silo] = nil
             siloHooked[silo] = nil
             siloJustFinished[silo] = nil
+            siloFinishedAt[silo]   = nil
             siloProducingSeen[silo] = nil
         end
     end)
@@ -2339,6 +2398,7 @@ task.spawn(function()
                 siloState[silo] = nil
                 siloProducingSeen[silo] = nil
                 siloJustFinished[silo] = nil
+                siloFinishedAt[silo] = nil
             end
         end
     end
