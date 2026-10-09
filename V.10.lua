@@ -497,7 +497,7 @@ local RANGE_TABLE = {
     ["Mothership"]          = 18,
 
     ["Destroyer"]           = 20,
-    ["Battleship"]          = 20,
+    ["Battleship"]          = 25,
     ["Aircraft Carrier"]    = 27,
     ["Gunboat"]             = 17.5,
     ["Submarine"]           = 16,
