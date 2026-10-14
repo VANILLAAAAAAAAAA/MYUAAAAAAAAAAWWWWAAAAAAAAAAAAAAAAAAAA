@@ -23,7 +23,7 @@ local TeamsFolder  = workspace:WaitForChild("Teams")
 -- ============================================================
 local Window = Library:CreateWindow({
     Title = 'BY UNKER AND LELOUCH, WITH THANKS TO BIG 30, OTF JAM AND JORDAN',
-    Center = true, AutoShow = true, TabPadding = 8, MenuFadeTime = 0.2
+    Center = true, AutoShow = false, TabPadding = 8, MenuFadeTime = 0.2
 })
 Window.ShowInToggleKeybind = false
 
