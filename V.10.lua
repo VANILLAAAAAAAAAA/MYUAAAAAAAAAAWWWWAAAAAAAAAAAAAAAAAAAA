@@ -1,6 +1,5 @@
 -- ============================================================
--- LELOUCHWARE V0.11 - RESTRUCTURED
--- One heartbeat. One dispatcher. One highlight manager.
+-- LELOUCHWARE V0.12 - RESTRUCTURED
 -- ============================================================
 
 local repo = 'https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/'
@@ -91,6 +90,14 @@ function TeamData.getColor(teamFolderOrName)
     local name
     if type(teamFolderOrName) == "string" then name = teamFolderOrName
     elseif teamFolderOrName then name = teamFolderOrName.Name else return Color3.new(1,1,1) end
+
+    -- Check live Teams first to always get up-to-date colors
+    for _, team in ipairs(TeamsService:GetChildren()) do
+        if team.Name == name and team.TeamColor then
+            return team.TeamColor.Color
+        end
+    end
+
     local cached = TeamData._teamColorByName[name]
     if cached then return cached end
 
@@ -98,16 +105,6 @@ function TeamData.getColor(teamFolderOrName)
     if ok and brick then
         TeamData._teamColorByName[name] = brick.Color
         return brick.Color
-    end
-    for _, team in ipairs(TeamsService:GetChildren()) do
-        if team.Name == name and team.TeamColor then
-            TeamData._teamColorByName[name] = team.TeamColor.Color
-            return team.TeamColor.Color
-        end
-        if team.TeamColor and team.TeamColor.Name == name then
-            TeamData._teamColorByName[name] = team.TeamColor.Color
-            return team.TeamColor.Color
-        end
     end
     TeamData._teamColorByName[name] = Color3.new(1,1,1)
     return Color3.new(1,1,1)
@@ -189,6 +186,8 @@ TeamSettings.ChildRemoved:Connect(function(child)
     TeamData.invalidateTeamColor(child.Name)
     TeamData.invalidatePlayerHistory(child.Name)
 end)
+
+-- (Event-driven color updates have been moved to the bottom of the script to fix scoping)
 
 -- Watch for any change inside any team's Allies folder.
 -- Uses ChildAdded/ChildRemoved on each Allies folder directly — DescendantRemoved
@@ -377,10 +376,13 @@ function HighlightManager._apply(adornee, entry)
 end
 
 function HighlightManager.tick()
+    local isRGB = (Options.HighlightMode and Options.HighlightMode.Value == 'RGB')
+    
     for adornee, entry in pairs(HighlightManager.active) do
         if not adornee.Parent or not entry.h or not entry.h.Parent then
             HighlightManager.detach(adornee)
-        else
+        elseif isRGB then
+            -- Only apply colors every frame for RGB mode. Team Colors are event-driven.
             HighlightManager._apply(adornee, entry)
         end
     end
@@ -639,7 +641,7 @@ function RangeIndicator.attach(unit)
     ring.Name = "RangeRing"
     ring.Parent = workspace
 
-    local entry = { ring = ring, parts = {}, outerPart = nil, innerPart = nil, innerDecal = nil, unit = unit }
+    local entry = { ring = ring, parts = {}, outerPart = nil, innerPart = nil, innerDecal = nil, unit = unit, teamName = unit.Parent and unit.Parent.Name }
     local bottomY = modelBottomY(unit)
 
     for _, part in ipairs(ring:GetChildren()) do
@@ -759,10 +761,19 @@ function RangeIndicator.maintain()
     if not RangeIndicator.enabled then return end
     if not RangeIndicator.storedTemplate then return end
 
-    -- Detach any unit that's no longer a live descendant of Teams
+    -- Detach any unit that's no longer a live descendant of Teams, or update if team changed
     for unit in pairs(RangeIndicator.ringsByUnit) do
         if not unit.Parent or not unit:IsDescendantOf(TeamsFolder) then
             RangeIndicator.detach(unit)
+        else
+            local tf = unit.Parent
+            if tf and tf.Parent == TeamsFolder then
+                local entry = RangeIndicator.ringsByUnit[unit]
+                if entry.teamName ~= tf.Name then
+                    entry.teamName = tf.Name
+                    RangeIndicator.applyColors(entry)
+                end
+            end
         end
     end
 
@@ -788,7 +799,7 @@ function RangeIndicator.followTick()
     local maxD   = RangeIndicator.maxDistance
     local doNear = RangeIndicator.disableNearby
     local nearD  = RangeIndicator.nearbyDistance
-    local rgb    = (Options.RangeColorMode and Options.RangeColorMode.Value == 'RGB')
+	local rgb = (Options.RangeColorMode and Options.RangeColorMode.Value == 'RGB')
 
     local dead = nil
     for unit, entry in pairs(RangeIndicator.ringsByUnit) do
@@ -798,6 +809,26 @@ function RangeIndicator.followTick()
         else
             local torso = unit:FindFirstChild("Torso") or unit:FindFirstChildWhichIsA("BasePart")
             if torso then
+                -- Recalculate yOffset while a building is still assembling.
+                -- During construction, parts of the model sit below the map and
+                -- rise up over time, which inflates the bounding box downward.
+                -- The yOffset captured at attach() time becomes stale, so the
+                -- ring gets stranded at a huge negative offset under the map.
+                -- Recalculate live so the ring tracks the actual bottom of the
+                -- model as it rises. A periodic safety check at 0.5s also
+                -- catches units where BuildProgress doesn't exist.
+                local bp = torso:FindFirstChild("BuildProgress")
+                local building = bp and bp:IsA("NumberValue") and bp.Value < 1
+                local now = tick()
+                if building or (now - (entry._lastYRecalc or 0) >= 0.5) then
+                    entry._lastYRecalc = now
+                    local ok, cf, size = pcall(function() return unit:GetBoundingBox() end)
+                    if ok and cf then
+                        local bottomY = cf.Position.Y - size.Y / 2
+                        entry.yOffset = bottomY - torso.Position.Y
+                    end
+                end
+
                 local dist = (camPos - torso.Position).Magnitude
                 local shouldHide = (doDist and dist > maxD) or (doNear and dist < nearD)
 
@@ -1634,6 +1665,16 @@ end
 function UpdateDisplaySize(display)
     local g = display.folder and display.folder:GetChildren() or {}
     local p = display.productionFolder and display.productionFolder:GetChildren() or {}
+    
+    -- [PERFORMANCE FIX] Check if there is anything to display
+    display.hasContent = (#g > 0) or (#p > 0)
+
+    if not display.hasContent then
+        display.gui.Enabled = false
+        display.part.CFrame = CFrame.new(0, -1000, 0) -- Hide offscreen to stop rendering completely
+        return
+    end
+
     local h = CalculateRequiredHeight(#g, #p)
     display.requiredHeight = h
     display.gui.CanvasSize = Vector2.new(CANVAS_WIDTH * CURRENT_SCALE, h * CURRENT_SCALE)
@@ -1646,6 +1687,12 @@ function UpdateDisplaySize(display)
 end
 
 local function UpdateOneDisplay(display, camPos, myTeam, myAllies)
+    -- [PERFORMANCE FIX] Skip processing entirely if there's nothing inside
+    if display.hasContent == false then
+        display.gui.Enabled = false
+        return
+    end
+
     local torso = display.torso
     if not torso or not torso.Parent then display.gui.Enabled = false; return end
     local pos = torso.Position
@@ -1887,6 +1934,13 @@ local function createPredictorMarker(position, color)
     local gy = ray and ray.Position.Y or 0
     part.CFrame = CFrame.new(position.X, gy + 0.5, position.Z) * CFrame.Angles(0, 0, math.rad(90))
     part.Parent = workspace
+    
+    -- [TEMPORARY FIX] Auto-destroy stuck marker after 20 seconds
+    task.delay(20, function()
+        if part and part.Parent then part:Destroy() end
+    end)
+    -- [/TEMPORARY FIX]
+
     return part
 end
 
@@ -1911,6 +1965,13 @@ local function createPathway(startPos, direction, groundY)
     local forward = right:Cross(up).Unit
     part.CFrame = CFrame.fromMatrix(flat, right, up, forward)
     part.Parent = workspace
+
+    -- [TEMPORARY FIX] Auto-destroy stuck pathway after 20 seconds
+    task.delay(20, function()
+        if part and part.Parent then part:Destroy() end
+    end)
+    -- [/TEMPORARY FIX]
+
     return part
 end
 
@@ -2664,12 +2725,9 @@ local function styleESP(part)
     local mode = Options.HighlightMode.Value
     local fill, outline
     if mode == 'Team Color' then
-        if info.teamColor then
-            fill = info.teamColor
-            outline = info.teamColor:Lerp(Color3.new(0,0,0), 0.3)
-        else
-            fill = Color3.new(1,1,1); outline = Color3.new(0,0,0)
-        end
+        local col = info.teamColor or Color3.new(1,1,1)
+        fill = col
+        outline = col:Lerp(Color3.new(0,0,0), 0.3)
     elseif mode == 'RGB' then
         fill = getGlobalRGBColor()
         outline = fill:Lerp(Color3.new(0,0,0), 0.3)
@@ -2688,14 +2746,28 @@ local function espHandleInstance(inst)
     if espHighlighted[part] then return end
     local model, teamName = findModelAndTeam(inst)
     if not model then return end
+
+    -- If already highlighted, check if the team changed (gamepass)
+    if espHighlighted[part] then
+        local info = espHighlighted[part]
+        if info.teamName ~= teamName then
+            info.teamName = teamName
+            info.teamColor = TeamData.getColor(teamName)
+            if Options.HighlightMode.Value == 'Team Color' then
+                local entry = HighlightManager.active[part]
+                if entry and entry.h then
+                    entry.h.FillColor = info.teamColor
+                    entry.h.OutlineColor = info.teamColor:Lerp(Color3.new(0,0,0), 0.3)
+                end
+            end
+        end
+        return 
+    end
+
     local modelName = model.Name
     if categoryTeamCheck(modelName) and teamName and not TeamData.isEnemy(teamName) then return end
     if not shouldHighlight(modelName) then return end
-    local teamColor = nil
-    if Options.HighlightMode.Value == 'Team Color' and teamName then
-        teamColor = TeamData.getColor(teamName)
-    end
-    espHighlighted[part] = { teamColor = teamColor }
+    espHighlighted[part] = { teamName = teamName, teamColor = TeamData.getColor(teamName) }
     HighlightManager.attach(part, styleESP)
 end
 
@@ -3189,7 +3261,7 @@ local WatermarkConnection = RunService.RenderStepped:Connect(function()
         FrameTimer = tick()
         FrameCounter = 0
     end
-    Library:SetWatermark(('LELOUCHWARE V0.11 | %s fps | %s ms'):format(
+    Library:SetWatermark(('LELOUCHWARE V0.12 | %s fps | %s ms'):format(
         math.floor(FPS),
         math.floor(game:GetService('Stats').Network.ServerStatsItem['Data Ping']:GetValue())
     ))
@@ -3210,7 +3282,53 @@ task.delay(2, function()
     RefreshPlayerInfo()
 end)
 
+-- ============================================================
+-- 100% EVENT-DRIVEN TEAM COLOR UPDATER (ZERO HEARTBEAT)
+-- ============================================================
+local function onTeamColorChanged(team)
+    local name = team.Name
+    TeamData.invalidateTeamColor(name)
+    local newColor = team.TeamColor.Color
+    
+    -- Update active ESP Highlights instantly
+    if espHighlighted then
+        for part, info in pairs(espHighlighted) do
+            if info.teamName == name then
+                info.teamColor = newColor
+                if Options.HighlightMode.Value == 'Team Color' then
+                    local entry = HighlightManager.active[part]
+                    if entry and entry.h then
+                        entry.h.FillColor = newColor
+                        entry.h.OutlineColor = newColor:Lerp(Color3.new(0,0,0), 0.3)
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Update active Range Indicators instantly
+    if RangeIndicator and RangeIndicator.ringsByUnit then
+        for unit, entry in pairs(RangeIndicator.ringsByUnit) do
+            if unit.Parent and unit.Parent.Name == name then
+                RangeIndicator.applyColors(entry)
+            end
+        end
+    end
+end
 
+-- Connect to existing teams
+for _, team in ipairs(TeamsService:GetChildren()) do
+    if team:IsA("Team") then
+        team:GetPropertyChangedSignal("TeamColor"):Connect(function() onTeamColorChanged(team) end)
+    end
+end
+
+-- Connect to teams that are added later
+TeamsService.ChildAdded:Connect(function(child)
+    if child:IsA("Team") then
+        child:GetPropertyChangedSignal("TeamColor"):Connect(function() onTeamColorChanged(child) end)
+    end
+end)
 
 
 SaveManager:LoadAutoloadConfig()
